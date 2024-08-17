@@ -1,8 +1,0 @@
-{
-    "files.associations": {
-        "__assert": "c",
-        "__config": "c",
-        "type_traits": "c",
-        "new": "c"
-    }
-}
