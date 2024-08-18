@@ -43,11 +43,12 @@ __device__ void mcts_expand(MCTSNode* node, int* board, int player);
 __device__ float mcts_evaluate(int* board, int player);
 __device__ void mcts_backpropagate(MCTSNode* node, float value);
 
-// CUDA helper functions
-__global__ void init_rng(curandState* states, unsigned long seed);
-
 // CPU helper functions
 void mcts_get_valid_moves(const IGame* game, const int* board, int player, bool* valid_moves);
 void mcts_apply_move(const IGame* game, int* board, int player, int action);
+
+// CUDA helper functions
+__global__ void init_rng(curandState* states, unsigned long seed);
+
 
 #endif // MCTS_CUH
