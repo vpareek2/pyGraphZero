@@ -39,8 +39,8 @@ void mcts_update_with_move(MCTSState* state, int action);
 __global__ void mcts_simulate_kernel(MCTSNode* nodes, int* board, int player, curandState* rng_states);
 __device__ float mcts_simulate(MCTSNode* node, int* board, int player, curandState* rng_state);
 __device__ MCTSNode* mcts_select(MCTSNode* node);
-__device__ void mcts_expand(MCTSNode* node, int* board, int player);
-__device__ float mcts_evaluate(int* board, int player);
+__device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game);
+__device__ float mcts_evaluate(int* board, int player, IGame* game);
 __device__ void mcts_backpropagate(MCTSNode* node, float value);
 
 // CPU helper functions
