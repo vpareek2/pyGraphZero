@@ -22,6 +22,8 @@ struct IGame {
     void (*get_symmetries)(const IGame* self, const int* board, const float* pi, int (*symmetries)[MAX_BOARD_SIZE], float (*symmetries_pi)[MAX_BOARD_SIZE], int* num_symmetries);
     void (*string_representation)(const IGame* self, const int* board, char* str, int str_size);
     void (*display)(const IGame* self, const int* board);
+    float (*evaluate)(const IGame* self, const int* board, int player);
+
 };
 
 #endif // GAME_H

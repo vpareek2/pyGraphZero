@@ -5,9 +5,9 @@
 #include <curand_kernel.h>
 #include "game.h"
 
-#define MAX_BOARD_SIZE 64
-#define MAX_CHILDREN 362  // Maximum possible moves in Go (19x19 + pass)
-#define C_PUCT 1.0
+#define MAX_BOARD_SIZE 64  // 8x8 board for chess
+#define MAX_CHILDREN 218   // Maximum possible moves in chess, most likely highest scale
+#define C_PUCT 1.0         // This can be tuned based on performance
 #define NUM_SIMULATIONS 1600
 #define THREADS_PER_BLOCK 256
 

@@ -36,6 +36,7 @@ void game_get_canonical_form(const TicTacToeGame* game, const int board[NUM_SQUA
 void game_get_symmetries(const TicTacToeGame* game, const int board[NUM_SQUARES], const float pi[], int symmetries[8][NUM_SQUARES], float symmetries_pi[8][NUM_SQUARES], int* num_symmetries);
 void game_string_representation(const TicTacToeGame* game, const int board[NUM_SQUARES], char* str, int str_size);
 void game_display(const int board[NUM_SQUARES]);
+float game_evaluate(const TicTacToeGame* game, const int board[NUM_SQUARES], int player);
 
 // Player functions
 int random_player_play(const TicTacToeGame* game, const int board[NUM_SQUARES]);

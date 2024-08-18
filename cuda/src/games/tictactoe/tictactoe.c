@@ -184,6 +184,46 @@ void game_display(const int board[NUM_SQUARES]) {
     }
 }
 
+float game_evaluate(const TicTacToeGame* game, const int board[NUM_SQUARES], int player) {
+    int opponent = -player;
+    int game_result = game_get_game_ended(game, board, player);
+    
+    if (game_result == 1) {
+        return 1.0;  // Current player wins
+    } else if (game_result == -1) {
+        return -1.0;  // Opponent wins
+    } else if (game_result == 1e-4) {
+        return 0.0;  // Draw
+    }
+    
+    // If the game hasn't ended, we'll do a simple evaluation
+    float score = 0.0;
+    
+    // Check rows, columns, and diagonals
+    int lines[8][3] = {
+        {0, 1, 2}, {3, 4, 5}, {6, 7, 8},  // Rows
+        {0, 3, 6}, {1, 4, 7}, {2, 5, 8},  // Columns
+        {0, 4, 8}, {2, 4, 6}  // Diagonals
+    };
+    
+    for (int i = 0; i < 8; i++) {
+        int player_count = 0;
+        int opponent_count = 0;
+        for (int j = 0; j < 3; j++) {
+            if (board[lines[i][j]] == player) player_count++;
+            else if (board[lines[i][j]] == opponent) opponent_count++;
+        }
+        
+        if (player_count > 0 && opponent_count == 0) {
+            score += 0.1 * player_count;
+        } else if (opponent_count > 0 && player_count == 0) {
+            score -= 0.1 * opponent_count;
+        }
+    }
+    
+    return score;
+}
+
 // Player functions
 int random_player_play(const TicTacToeGame* game, const int board[NUM_SQUARES]) {
     bool valid_moves[NUM_SQUARES];
@@ -255,8 +295,6 @@ int greedy_player_play(const TicTacToeGame* game, const int board[NUM_SQUARES]) 
 }
 
 void tictactoe_game_wrapper_init(TicTacToeGameWrapper* wrapper) {
-    game_init(&wrapper->game);
-    
     wrapper->base.init = (void (*)(IGame*))game_init;
     wrapper->base.get_init_board = (void (*)(const IGame*, int*))game_get_init_board;
     wrapper->base.get_board_size = (void (*)(const IGame*, int*, int*))game_get_board_size;
@@ -265,7 +303,11 @@ void tictactoe_game_wrapper_init(TicTacToeGameWrapper* wrapper) {
     wrapper->base.get_valid_moves = (void (*)(const IGame*, const int*, int, bool*))game_get_valid_moves;
     wrapper->base.get_game_ended = (int (*)(const IGame*, const int*, int))game_get_game_ended;
     wrapper->base.get_canonical_form = (void (*)(const IGame*, const int*, int, int*))game_get_canonical_form;
-    wrapper->base.get_symmetries = (void (*)(const IGame*, const int*, const float*, int*, float*, int*))game_get_symmetries;
+    wrapper->base.get_symmetries = (void (*)(const IGame*, const int*, const float*, int (*)[MAX_BOARD_SIZE], float (*)[MAX_BOARD_SIZE], int*))game_get_symmetries;
     wrapper->base.string_representation = (void (*)(const IGame*, const int*, char*, int))game_string_representation;
     wrapper->base.display = (void (*)(const IGame*, const int*))game_display;
+    
+    wrapper->base.evaluate = (float (*)(const IGame*, const int*, int))game_evaluate;
+
+    game_init(&wrapper->game);
 }

@@ -186,9 +186,7 @@ __device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game)
 }
 
 __device__ float mcts_evaluate(int* board, int player, IGame* game) {
-    // This should be implemented based on the specific game
-    // For now, we'll return a random value
-    return curand_uniform(rng_state);
+    return game->evaluate(game, board, player);
 }
 
 __device__ void mcts_backpropagate(MCTSNode* node, float value) {
