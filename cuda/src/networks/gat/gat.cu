@@ -2,6 +2,9 @@
 
 #include <curand.h>
 #include <torch/serialize.h>
+#include <cublas_v2.h>
+#include <thrust/device_vector.h>
+#include <thrust/transform_reduce.h>
 
 static void gat_init(INeuralNet* self, const IGame* game) {
     GATWrapper* wrapper = (GATWrapper*)self;
@@ -54,19 +57,54 @@ static void gat_init(INeuralNet* self, const IGame* game) {
     model->workspace_size = workspace_size;
 }
 
-INeuralNet* create_gat_model(const IGame* game) {
-    GATWrapper* wrapper = (GATWrapper*)malloc(sizeof(GATWrapper));
-    wrapper->base.impl = wrapper;
-    wrapper->base.init = gat_init;
-    wrapper->base.train = gat_train;
-    wrapper->base.predict = gat_predict;
-    wrapper->base.save_checkpoint = gat_save_checkpoint;
-    wrapper->base.load_checkpoint = gat_load_checkpoint;
-    wrapper->base.destroy = gat_destroy;
+// Main training function
+static void gat_train(INeuralNet* self, TrainingExample* examples, int num_examples) {
+    GATWrapper* wrapper = (GATWrapper*)self;
+    GATModel* model = &wrapper->model;
 
-    gat_init(&wrapper->base, game);
+    for (int epoch = 0; epoch < model->config.epochs; epoch++) {
+        printf("EPOCH ::: %d\n", epoch + 1);
 
-    return &wrapper->base;
+        float pi_loss_sum = 0.0f;
+        float v_loss_sum = 0.0f;
+        int batch_count = num_examples / model->config.batch_size;
+
+        for (int batch = 0; batch < batch_count; batch++) {
+            // Prepare batch data
+            float *batch_boards, *batch_pis, *batch_vs;
+            prepare_batch(examples, num_examples, model->config.batch_size, &batch_boards, &batch_pis, &batch_vs);
+
+            // Forward pass
+            float *out_pi, *out_v;
+            cudaMalloc(&out_pi, model->config.batch_size * model->config.num_actions * sizeof(float));
+            cudaMalloc(&out_v, model->config.batch_size * sizeof(float));
+            forward_gat(model, batch_boards, &out_pi, &out_v);
+
+            // Compute losses
+            auto [pi_loss, v_loss] = compute_losses(batch_pis, batch_vs, out_pi, out_v, 
+                                                    model->config.batch_size, model->config.num_actions);
+            pi_loss_sum += pi_loss;
+            v_loss_sum += v_loss;
+
+            // Backward pass
+            backward_gat(model, batch_boards, batch_pis, batch_vs, out_pi, out_v);
+
+            // Update weights using Adam optimizer
+            model->optimizer->step();
+            model->optimizer->zero_grad();
+
+            // Clean up
+            cudaFree(batch_boards);
+            cudaFree(batch_pis);
+            cudaFree(batch_vs);
+            cudaFree(out_pi);
+            cudaFree(out_v);
+        }
+
+        // Print epoch results
+        printf("Average Policy Loss: %f, Average Value Loss: %f\n", 
+               pi_loss_sum / batch_count, v_loss_sum / batch_count);
+    }
 }
 
 static void gat_save_checkpoint(INeuralNet* self, const char* folder, const char* filename) {
@@ -243,6 +281,21 @@ static void gat_destroy(INeuralNet* self) {
     free(wrapper);
 }
 
+INeuralNet* create_gat_model(const IGame* game) {
+    GATWrapper* wrapper = (GATWrapper*)malloc(sizeof(GATWrapper));
+    wrapper->base.impl = wrapper;
+    wrapper->base.init = gat_init;
+    wrapper->base.train = gat_train;
+    wrapper->base.predict = gat_predict;
+    wrapper->base.save_checkpoint = gat_save_checkpoint;
+    wrapper->base.load_checkpoint = gat_load_checkpoint;
+    wrapper->base.destroy = gat_destroy;
+
+    gat_init(&wrapper->base, game);
+
+    return &wrapper->base;
+}
+
 /*************************************************************************************************************************************************************
  * INIT HELPER FUNCTIONS
 **************************************************************************************************************************************************************/
@@ -330,4 +383,326 @@ static void init_weights(GATModel* model) {
     curandGenerateNormal(gen, model->policy_bias, model->config.num_actions, 0, 0.1);
 
     curandDestroyGenerator(gen);
+}
+
+/*************************************************************************************************************************************************************
+ * TRAIN HELPER FUNCTIONS
+**************************************************************************************************************************************************************/
+
+// Helper function to prepare batch data
+static void prepare_batch(TrainingExample* examples, int num_examples, int batch_size,
+                          float** batch_boards, float** batch_pis, float** batch_vs) {
+    cudaMalloc(batch_boards, batch_size * sizeof(float) * MAX_NODES * MAX_FEATURES);
+    cudaMalloc(batch_pis, batch_size * sizeof(float) * NUM_ACTIONS);
+    cudaMalloc(batch_vs, batch_size * sizeof(float));
+
+    // Use cuRAND for random selection
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen, time(NULL));
+
+    int* d_indices;
+    cudaMalloc(&d_indices, batch_size * sizeof(int));
+    curandGenerate(gen, (unsigned int*)d_indices, batch_size);
+
+    // Custom CUDA kernel to prepare batch
+    dim3 grid((batch_size + 255) / 256);
+    dim3 block(256);
+    prepare_batch_kernel<<<grid, block>>>(examples, num_examples, d_indices, *batch_boards, *batch_pis, *batch_vs, batch_size);
+
+    cudaFree(d_indices);
+    curandDestroyGenerator(gen);
+}
+
+// CUDA kernel for batch preparation
+__global__ void prepare_batch_kernel(TrainingExample* examples, int num_examples, int* indices,
+                                     float* batch_boards, float* batch_pis, float* batch_vs, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        int example_idx = indices[idx] % num_examples;
+        memcpy(batch_boards + idx * MAX_NODES * MAX_FEATURES, examples[example_idx].board, MAX_NODES * MAX_FEATURES * sizeof(float));
+        memcpy(batch_pis + idx * NUM_ACTIONS, examples[example_idx].pi, NUM_ACTIONS * sizeof(float));
+        batch_vs[idx] = examples[example_idx].v;
+    }
+}
+
+// Helper function for forward pass
+static void forward_gat(GATModel* model, float* batch_boards, float** out_pi, float** out_v) {
+    cudnnHandle_t cudnn = model->cudnn_handle;
+    cublasHandle_t cublas;
+    cublasCreate(&cublas);
+
+    float alpha = 1.0f, beta = 0.0f;
+    
+    // Input layer
+    cudnnConvolutionForward(cudnn, &alpha, model->input_descriptor, batch_boards,
+                            model->input_filter, model->input_weights,
+                            model->conv_descriptor, CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
+                            model->workspace, model->workspace_size, &beta, model->layer_descriptors[0], model->layer_outputs[0]);
+
+    // GAT layers
+    for (int i = 0; i < model->config.num_layers; i++) {
+        // Attention mechanism (custom CUDA kernel)
+        dim3 grid((model->config.max_nodes + 255) / 256, model->config.num_heads);
+        dim3 block(256);
+        compute_attention<<<grid, block>>>(model->layer_outputs[i], model->attention_weights[i], 
+                                           model->attention_scores[i], model->config.max_nodes, 
+                                           model->config.hidden_features, model->config.num_heads);
+
+        // Apply attention (custom CUDA kernel)
+        apply_attention<<<grid, block>>>(model->layer_outputs[i], model->attention_scores[i], 
+                                         model->layer_outputs[i+1], model->config.max_nodes, 
+                                         model->config.hidden_features, model->config.num_heads);
+
+        // Linear transformation
+        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    model->config.hidden_features, model->config.max_nodes, model->config.hidden_features,
+                    &alpha, model->layer_weights[i], model->config.hidden_features,
+                    model->layer_outputs[i+1], model->config.hidden_features,
+                    &beta, model->layer_outputs[i+1], model->config.hidden_features);
+
+        // Add bias and apply activation (custom CUDA kernel)
+        add_bias_activate<<<grid, block>>>(model->layer_outputs[i+1], model->layer_biases[i], 
+                                           model->config.max_nodes, model->config.hidden_features);
+    }
+
+    // Output layer
+    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                model->config.num_actions, model->config.batch_size, model->config.hidden_features,
+                &alpha, model->policy_weights, model->config.num_actions,
+                model->layer_outputs[model->config.num_layers], model->config.hidden_features,
+                &beta, *out_pi, model->config.num_actions);
+
+    cublasSgemv(cublas, CUBLAS_OP_N,
+                1, model->config.hidden_features,
+                &alpha, model->value_weights, 1,
+                model->layer_outputs[model->config.num_layers], 1,
+                &beta, *out_v, 1);
+
+    // Apply softmax to policy output (custom CUDA kernel)
+    dim3 grid_policy((model->config.num_actions + 255) / 256, model->config.batch_size);
+    dim3 block_policy(256);
+    softmax<<<grid_policy, block_policy>>>(*out_pi, model->config.num_actions);
+
+    // Apply tanh to value output (custom CUDA kernel)
+    dim3 grid_value((model->config.batch_size + 255) / 256);
+    dim3 block_value(256);
+    tanh_activate<<<grid_value, block_value>>>(*out_v, model->config.batch_size);
+
+    cublasDestroy(cublas);
+}
+
+// Helper function to compute losses
+static std::pair<float, float> compute_losses(float* target_pi, float* target_v, float* out_pi, float* out_v, int batch_size, int action_size) {
+    // Use PyTorch for loss computation
+    auto target_pi_tensor = torch::from_blob(target_pi, {batch_size, action_size}, torch::kFloat32);
+    auto target_v_tensor = torch::from_blob(target_v, {batch_size}, torch::kFloat32);
+    auto out_pi_tensor = torch::from_blob(out_pi, {batch_size, action_size}, torch::kFloat32);
+    auto out_v_tensor = torch::from_blob(out_v, {batch_size}, torch::kFloat32);
+
+    auto pi_loss = torch::nn::functional::kl_div(out_pi_tensor.log(), target_pi_tensor, torch::Reduction::Sum);
+    auto v_loss = torch::mse_loss(out_v_tensor, target_v_tensor, torch::Reduction::Sum);
+
+    return {pi_loss.item<float>() / batch_size, v_loss.item<float>() / batch_size};
+}
+
+#include <cudnn.h>
+#include <cublas_v2.h>
+
+static void backward_gat(GATModel* model, float* batch_boards, float* target_pi, float* target_v, float* out_pi, float* out_v) {
+    cudnnHandle_t cudnn = model->cudnn_handle;
+    cublasHandle_t cublas;
+    cublasCreate(&cublas);
+
+    float alpha = 1.0f, beta = 0.0f;
+
+    // Compute gradients for policy and value heads
+    float* d_policy, *d_value;
+    cudaMalloc(&d_policy, model->config.batch_size * model->config.num_actions * sizeof(float));
+    cudaMalloc(&d_value, model->config.batch_size * sizeof(float));
+
+    // Policy loss gradient
+    softmax_cross_entropy_gradient<<<(model->config.num_actions + 255) / 256, 256>>>(
+        out_pi, target_pi, d_policy, model->config.batch_size, model->config.num_actions);
+
+    // Value loss gradient
+    mse_gradient<<<(model->config.batch_size + 255) / 256, 256>>>(
+        out_v, target_v, d_value, model->config.batch_size);
+
+    // Backpropagate through output layer
+    cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                model->config.hidden_features, model->config.batch_size, model->config.num_actions,
+                &alpha, model->policy_weights, model->config.num_actions,
+                d_policy, model->config.num_actions,
+                &beta, model->d_last_layer, model->config.hidden_features);
+
+    cublasSger(cublas, model->config.hidden_features, model->config.batch_size,
+               &alpha, model->value_weights, 1,
+               d_value, 1,
+               model->d_last_layer, model->config.hidden_features);
+
+    // Backpropagate through GAT layers
+    for (int i = model->config.num_layers - 1; i >= 0; i--) {
+        // Backpropagate through attention mechanism
+        backward_attention<<<(model->config.max_nodes + 255) / 256, 256>>>(
+            model->layer_outputs[i], model->attention_scores[i], model->d_last_layer,
+            model->d_attention_weights[i], model->d_layer_outputs[i],
+            model->config.max_nodes, model->config.hidden_features, model->config.num_heads);
+
+        // Backpropagate through linear transformation
+        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                    model->config.hidden_features, model->config.hidden_features, model->config.max_nodes,
+                    &alpha, model->d_layer_outputs[i], model->config.hidden_features,
+                    model->layer_weights[i], model->config.hidden_features,
+                    &beta, model->d_last_layer, model->config.hidden_features);
+
+        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    model->config.hidden_features, model->config.max_nodes, model->config.hidden_features,
+                    &alpha, model->layer_weights[i], model->config.hidden_features,
+                    model->d_layer_outputs[i], model->config.hidden_features,
+                    &beta, model->d_layer_weights[i], model->config.hidden_features);
+
+        // Compute gradient for biases
+        cublasSgemv(cublas, CUBLAS_OP_N,
+                    model->config.hidden_features, model->config.max_nodes,
+                    &alpha, model->d_layer_outputs[i], model->config.hidden_features,
+                    model->ones, 1,
+                    &beta, model->d_layer_biases[i], 1);
+
+        // Backpropagate activation function
+        backward_activation<<<(model->config.max_nodes * model->config.hidden_features + 255) / 256, 256>>>(
+            model->layer_outputs[i], model->d_last_layer,
+            model->config.max_nodes * model->config.hidden_features);
+    }
+
+    // Backpropagate through input layer
+    cudnnConvolutionBackwardFilter(cudnn, &alpha,
+                                   model->input_descriptor, batch_boards,
+                                   model->layer_descriptors[0], model->d_last_layer,
+                                   model->conv_descriptor, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0,
+                                   model->workspace, model->workspace_size,
+                                   &beta, model->input_filter, model->d_input_weights);
+
+    cudnnConvolutionBackwardData(cudnn, &alpha,
+                                 model->input_filter, model->input_weights,
+                                 model->layer_descriptors[0], model->d_last_layer,
+                                 model->conv_descriptor, CUDNN_CONVOLUTION_BWD_DATA_ALGO_0,
+                                 model->workspace, model->workspace_size,
+                                 &beta, model->input_descriptor, model->d_input_data);
+
+    // Clean up
+    cudaFree(d_policy);
+    cudaFree(d_value);
+    cublasDestroy(cublas);
+}
+
+// Custom CUDA kernel implementations
+
+__global__ void compute_attention(float* inputs, float* weights, float* scores, int num_nodes, int hidden_size, int num_heads) {
+    int node_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int head_idx = blockIdx.y;
+
+    if (node_idx < num_nodes) {
+        for (int i = 0; i < num_nodes; i++) {
+            float score = 0.0f;
+            for (int j = 0; j < hidden_size; j++) {
+                int input_idx = node_idx * hidden_size + j;
+                int weight_idx = head_idx * 2 * hidden_size + j;
+                score += inputs[input_idx] * weights[weight_idx];
+                score += inputs[i * hidden_size + j] * weights[weight_idx + hidden_size];
+            }
+            scores[head_idx * num_nodes * num_nodes + node_idx * num_nodes + i] = score;
+        }
+    }
+}
+
+__global__ void apply_attention(float* inputs, float* scores, float* outputs, int num_nodes, int hidden_size, int num_heads) {
+    int node_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int head_idx = blockIdx.y;
+    int feature_idx = threadIdx.y;
+
+    if (node_idx < num_nodes && feature_idx < hidden_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < num_nodes; i++) {
+            int score_idx = head_idx * num_nodes * num_nodes + node_idx * num_nodes + i;
+            int input_idx = i * hidden_size + feature_idx;
+            sum += scores[score_idx] * inputs[input_idx];
+        }
+        outputs[head_idx * num_nodes * hidden_size + node_idx * hidden_size + feature_idx] = sum;
+    }
+}
+
+__global__ void add_bias_activate(float* outputs, float* biases, int num_nodes, int hidden_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_nodes * hidden_size) {
+        int feature_idx = idx % hidden_size;
+        outputs[idx] = max(0.0f, outputs[idx] + biases[feature_idx]);  // ReLU activation
+    }
+}
+
+__global__ void softmax(float* inputs, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float max_val = inputs[idx * size];
+        for (int i = 1; i < size; i++) {
+            max_val = max(max_val, inputs[idx * size + i]);
+        }
+        
+        float sum = 0.0f;
+        for (int i = 0; i < size; i++) {
+            inputs[idx * size + i] = exp(inputs[idx * size + i] - max_val);
+            sum += inputs[idx * size + i];
+        }
+        
+        for (int i = 0; i < size; i++) {
+            inputs[idx * size + i] /= sum;
+        }
+    }
+}
+
+__global__ void tanh_activate(float* inputs, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        inputs[idx] = tanh(inputs[idx]);
+    }
+}
+
+__global__ void softmax_cross_entropy_gradient(float* output, float* target, float* gradient, int batch_size, int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * num_classes) {
+        gradient[idx] = output[idx] - target[idx];
+    }
+}
+
+__global__ void mse_gradient(float* output, float* target, float* gradient, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        gradient[idx] = 2 * (output[idx] - target[idx]);
+    }
+}
+
+__global__ void backward_attention(float* inputs, float* scores, float* grad_output, float* grad_weights, float* grad_inputs, int num_nodes, int hidden_size, int num_heads) {
+    int node_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int head_idx = blockIdx.y;
+
+    if (node_idx < num_nodes) {
+        for (int i = 0; i < num_nodes; i++) {
+            float grad_score = 0.0f;
+            for (int j = 0; j < hidden_size; j++) {
+                int grad_idx = head_idx * num_nodes * hidden_size + i * hidden_size + j;
+                int input_idx = node_idx * hidden_size + j;
+                grad_score += grad_output[grad_idx] * inputs[input_idx];
+                atomicAdd(&grad_inputs[input_idx], grad_output[grad_idx] * scores[head_idx * num_nodes * num_nodes + i * num_nodes + node_idx]);
+            }
+            atomicAdd(&grad_weights[head_idx * 2 * hidden_size + node_idx], grad_score);
+            atomicAdd(&grad_weights[head_idx * 2 * hidden_size + hidden_size + i], grad_score);
+        }
+    }
+}
+
+__global__ void backward_activation(float* inputs, float* grad_output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        grad_output[idx] *= (inputs[idx] > 0.0f) ? 1.0f : 0.0f;  // ReLU gradient
+    }
 }
