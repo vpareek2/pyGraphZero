@@ -3,36 +3,51 @@
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
-#include "../games/tictactoe/tictactoe.h"
+#include "game.h"
 
-#define BOARD_SIZE 3
-#define NUM_SQUARES (BOARD_SIZE * BOARD_SIZE)
+#define MAX_BOARD_SIZE 64
+#define MAX_CHILDREN 362  // Maximum possible moves in Go (19x19 + pass)
+#define C_PUCT 1.0
+#define NUM_SIMULATIONS 1600
+#define THREADS_PER_BLOCK 256
 
-// Node structure for the MCTS tree
-typedef struct Node {
-    int board[NUM_SQUARES];
-    struct Node** children;
+typedef struct MCTSNode {
+    int board[MAX_BOARD_SIZE];
+    MCTSNode* children[MAX_CHILDREN];
     int num_children;
-    struct Node* parent;
-    int visits;
-    float score;
+    float P[MAX_CHILDREN];
+    float Q[MAX_CHILDREN];
+    int N[MAX_CHILDREN];
+    int visit_count;
+    float value_sum;
     int player;
-} Node;
+    int action;
+} MCTSNode;
 
-// Function declarations for MCTS
-Node* create_node(const int board[NUM_SQUARES], int player, Node* parent);
-void free_node(Node* node);
-Node* select_node(Node* root, const TicTacToeGame* game);
-void expand_node(Node* node, const TicTacToeGame* game);
-float simulate(const TicTacToeGame* game, int board[NUM_SQUARES], int player);
-void backpropagate(Node* node, float score);
-Node* mcts_search(const TicTacToeGame* game, int board[NUM_SQUARES], int player, int num_iterations);
+typedef struct MCTSState {
+    IGame* game;
+    MCTSNode* root;
+} MCTSState;
 
-// CUDA kernel declarations
-__global__ void init_rand_kernel(curandState* states, unsigned long seed);
-__global__ void mcts_simulation_kernel(curandState* states, Node* nodes, int num_nodes, TicTacToeGame* game, float* results);
+// CPU functions
+MCTSState* mcts_init(IGame* game);
+void mcts_free(MCTSState* state);
+int mcts_select_action(MCTSState* state, float temperature);
+void mcts_update_with_move(MCTSState* state, int action);
 
-// CUDA-related function declarations
-void cuda_mcts_simulate(Node** leaf_nodes, int num_leaves, const TicTacToeGame* game, float* scores);
+// CUDA kernel functions
+__global__ void mcts_simulate_kernel(MCTSNode* nodes, int* board, int player, curandState* rng_states);
+__device__ float mcts_simulate(MCTSNode* node, int* board, int player, curandState* rng_state);
+__device__ MCTSNode* mcts_select(MCTSNode* node);
+__device__ void mcts_expand(MCTSNode* node, int* board, int player);
+__device__ float mcts_evaluate(int* board, int player);
+__device__ void mcts_backpropagate(MCTSNode* node, float value);
+
+// CUDA helper functions
+__global__ void init_rng(curandState* states, unsigned long seed);
+
+// CPU helper functions
+void mcts_get_valid_moves(const IGame* game, const int* board, int player, bool* valid_moves);
+void mcts_apply_move(const IGame* game, int* board, int player, int action);
 
 #endif // MCTS_CUH
