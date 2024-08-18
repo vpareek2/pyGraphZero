@@ -253,3 +253,19 @@ int greedy_player_play(const TicTacToeGame* game, const int board[NUM_SQUARES]) 
     
     return best_action;
 }
+
+void tictactoe_game_wrapper_init(TicTacToeGameWrapper* wrapper) {
+    game_init(&wrapper->game);
+    
+    wrapper->base.init = (void (*)(IGame*))game_init;
+    wrapper->base.get_init_board = (void (*)(const IGame*, int*))game_get_init_board;
+    wrapper->base.get_board_size = (void (*)(const IGame*, int*, int*))game_get_board_size;
+    wrapper->base.get_action_size = (int (*)(const IGame*))game_get_action_size;
+    wrapper->base.get_next_state = (void (*)(const IGame*, const int*, int, int, int*, int*))game_get_next_state;
+    wrapper->base.get_valid_moves = (void (*)(const IGame*, const int*, int, bool*))game_get_valid_moves;
+    wrapper->base.get_game_ended = (int (*)(const IGame*, const int*, int))game_get_game_ended;
+    wrapper->base.get_canonical_form = (void (*)(const IGame*, const int*, int, int*))game_get_canonical_form;
+    wrapper->base.get_symmetries = (void (*)(const IGame*, const int*, const float*, int*, float*, int*))game_get_symmetries;
+    wrapper->base.string_representation = (void (*)(const IGame*, const int*, char*, int))game_string_representation;
+    wrapper->base.display = (void (*)(const IGame*, const int*))game_display;
+}

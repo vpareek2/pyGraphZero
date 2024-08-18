@@ -2,6 +2,7 @@
 #define TICTACTOE_H
 
 #include <stdbool.h>
+#include "../game.h"
 
 #define BOARD_SIZE 3
 #define NUM_SQUARES (BOARD_SIZE * BOARD_SIZE)
@@ -40,5 +41,12 @@ void game_display(const int board[NUM_SQUARES]);
 int random_player_play(const TicTacToeGame* game, const int board[NUM_SQUARES]);
 int human_player_play(const TicTacToeGame* game, const int board[NUM_SQUARES]);
 int greedy_player_play(const TicTacToeGame* game, const int board[NUM_SQUARES]);
+
+typedef struct {
+    IGame base;
+    TicTacToeGame game;
+} TicTacToeGameWrapper;
+
+void tictactoe_game_wrapper_init(TicTacToeGameWrapper* wrapper);
 
 #endif // TICTACTOE_H
