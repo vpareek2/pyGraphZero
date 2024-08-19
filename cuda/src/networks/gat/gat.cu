@@ -6,6 +6,17 @@
 #include <cublas_v2.h>
 #include <thrust/device_vector.h>
 #include <thrust/transform_reduce.h>
+
+/*************************************************************************************************************************************************************
+ * CUDA ERROR CHECKING
+**************************************************************************************************************************************************************/
+
+#define CUDNN_CHECK(call) { cudnnStatus_t status = call; if (status != CUDNN_STATUS_SUCCESS) { fprintf(stderr, "CUDNN error at %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(status)); exit(1); } }
+#define CUDA_CHECK(call) { cudaError_t status = call; if (status != cudaSuccess) { fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); exit(1); } }
+#define CURAND_CHECK(call) { curandStatus_t status = call; if (status != CURAND_STATUS_SUCCESS) { fprintf(stderr, "CURAND error at %s:%d: %d\n", __FILE__, __LINE__, status); exit(1); } }
+
+/*************************************************************************************************************************************************************/
+
 static void gat_init(INeuralNet* self, const IGame* game) {
     GATWrapper* wrapper = (GATWrapper*)self;
     GATModel* model = &wrapper->model;
@@ -316,14 +327,6 @@ INeuralNet* create_gat_model(const IGame* game) {
 
     return &wrapper->base;
 }
-
-/*************************************************************************************************************************************************************
- * CUDA ERROR CHECKING
-**************************************************************************************************************************************************************/
-
-#define CUDNN_CHECK(call) { cudnnStatus_t status = call; if (status != CUDNN_STATUS_SUCCESS) { fprintf(stderr, "CUDNN error at %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(status)); exit(1); } }
-#define CUDA_CHECK(call) { cudaError_t status = call; if (status != cudaSuccess) { fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); exit(1); } }
-#define CURAND_CHECK(call) { curandStatus_t status = call; if (status != CURAND_STATUS_SUCCESS) { fprintf(stderr, "CURAND error at %s:%d: %d\n", __FILE__, __LINE__, status); exit(1); } }
 
 /*************************************************************************************************************************************************************
  * INIT HELPER FUNCTIONS
