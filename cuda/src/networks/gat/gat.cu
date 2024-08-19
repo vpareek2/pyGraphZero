@@ -1,13 +1,11 @@
-// TODO: Predict function, fix training function make it better and make sure everything is used correct
-
 #include "gat.cuh"
 
 #include <curand.h>
+#include <chrono>
 #include <torch/serialize.h>
 #include <cublas_v2.h>
 #include <thrust/device_vector.h>
 #include <thrust/transform_reduce.h>
-
 static void gat_init(INeuralNet* self, const IGame* game) {
     GATWrapper* wrapper = (GATWrapper*)self;
     GATModel* model = &wrapper->model;
@@ -16,32 +14,35 @@ static void gat_init(INeuralNet* self, const IGame* game) {
     init_model_config(model, game);
 
     // Initialize cuDNN
-    cudnnCreate(&model->cudnn_handle);
+    CUDNN_CHECK(cudnnCreate(&model->cudnn_handle));
 
     // Initialize input block
-    init_input_block(model);
+    CUDA_CHECK(init_input_block(model));
 
     // Initialize GAT layers
-    init_gat_layers(model);
+    CUDA_CHECK(init_gat_layers(model));
 
     // Initialize output block
-    init_output_block(model);
+    CUDA_CHECK(init_output_block(model));
 
     // Initialize weights
-    init_weights(model);
+    CUDA_CHECK(init_weights(model));
 
     // Initialize PyTorch optimizer
     std::vector<torch::Tensor> params;
+
     // Add all weights and biases to params vector
     // Input block
     params.push_back(torch::from_blob(model->input_weights, {model->config.input_features, model->config.hidden_features}, torch::kCUDA));
     params.push_back(torch::from_blob(model->input_bias, {model->config.hidden_features}, torch::kCUDA));
+
     // GAT layers
     for (int i = 0; i < model->config.num_layers; i++) {
         params.push_back(torch::from_blob(model->layer_weights[i], {model->config.hidden_features, model->config.hidden_features}, torch::kCUDA));
         params.push_back(torch::from_blob(model->layer_biases[i], {model->config.hidden_features}, torch::kCUDA));
         params.push_back(torch::from_blob(model->attention_weights[i], {model->config.num_heads, 2, model->config.hidden_features}, torch::kCUDA));
     }
+
     // Output block
     params.push_back(torch::from_blob(model->value_weights, {model->config.hidden_features}, torch::kCUDA));
     params.push_back(torch::from_blob(model->value_bias, {1}, torch::kCUDA));
@@ -52,17 +53,27 @@ static void gat_init(INeuralNet* self, const IGame* game) {
 
     // Allocate workspace for cuDNN
     size_t workspace_size = 0;
-    cudnnGetConvolutionForwardWorkspaceSize(model->cudnn_handle, model->input_descriptor, model->layer_descriptors[0],
-                                            /* convolution descriptor */, model->layer_descriptors[0],
-                                            CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM, &workspace_size);
-    cudaMalloc(&model->workspace, workspace_size);
+    CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(model->cudnn_handle, model->input_descriptor, model->layer_descriptors[0],
+        /* convolution descriptor */, model->layer_descriptors[0],
+        CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM, &workspace_size));
+    CUDA_CHECK(cudaMalloc(&model->workspace, workspace_size));
     model->workspace_size = workspace_size;
 }
 
-// Main training function
 static void gat_train(INeuralNet* self, TrainingExample* examples, int num_examples) {
     GATWrapper* wrapper = (GATWrapper*)self;
     GATModel* model = &wrapper->model;
+
+    // Allocate memory for batch data
+    float *batch_boards, *batch_pis, *batch_vs;
+    CUDA_CHECK(cudaMalloc(&batch_boards, model->config.batch_size * MAX_NODES * MAX_FEATURES * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&batch_pis, model->config.batch_size * model->config.num_actions * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&batch_vs, model->config.batch_size * sizeof(float)));
+
+    // Allocate memory for output
+    float *out_pi, *out_v;
+    CUDA_CHECK(cudaMalloc(&out_pi, model->config.batch_size * model->config.num_actions * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&out_v, model->config.batch_size * sizeof(float)));
 
     for (int epoch = 0; epoch < model->config.epochs; epoch++) {
         printf("EPOCH ::: %d\n", epoch + 1);
@@ -73,14 +84,14 @@ static void gat_train(INeuralNet* self, TrainingExample* examples, int num_examp
 
         for (int batch = 0; batch < batch_count; batch++) {
             // Prepare batch data
-            float *batch_boards, *batch_pis, *batch_vs;
-            prepare_batch(examples, num_examples, model->config.batch_size, &batch_boards, &batch_pis, &batch_vs);
+            prepare_batch(examples, num_examples, model->config.batch_size, batch_boards, batch_pis, batch_vs);
 
             // Forward pass
-            float *out_pi, *out_v;
-            cudaMalloc(&out_pi, model->config.batch_size * model->config.num_actions * sizeof(float));
-            cudaMalloc(&out_v, model->config.batch_size * sizeof(float));
+            auto start_time = std::chrono::high_resolution_clock::now();
             forward_gat(model, batch_boards, &out_pi, &out_v);
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+            printf("Forward pass took %lld microseconds\n", duration.count());
 
             // Compute losses
             auto [pi_loss, v_loss] = compute_losses(batch_pis, batch_vs, out_pi, out_v, 
@@ -89,24 +100,32 @@ static void gat_train(INeuralNet* self, TrainingExample* examples, int num_examp
             v_loss_sum += v_loss;
 
             // Backward pass
+            start_time = std::chrono::high_resolution_clock::now();
             backward_gat(model, batch_boards, batch_pis, batch_vs, out_pi, out_v);
+            end_time = std::chrono::high_resolution_clock::now();
+            duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+            printf("Backward pass took %lld microseconds\n", duration.count());
 
             // Update weights using Adam optimizer
+            start_time = std::chrono::high_resolution_clock::now();
             model->optimizer->step();
             model->optimizer->zero_grad();
-
-            // Clean up
-            cudaFree(batch_boards);
-            cudaFree(batch_pis);
-            cudaFree(batch_vs);
-            cudaFree(out_pi);
-            cudaFree(out_v);
+            end_time = std::chrono::high_resolution_clock::now();
+            duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+            printf("Optimizer step took %lld microseconds\n", duration.count());
         }
 
         // Print epoch results
         printf("Average Policy Loss: %f, Average Value Loss: %f\n", 
                pi_loss_sum / batch_count, v_loss_sum / batch_count);
     }
+
+    // Clean up
+    CUDA_CHECK(cudaFree(batch_boards));
+    CUDA_CHECK(cudaFree(batch_pis));
+    CUDA_CHECK(cudaFree(batch_vs));
+    CUDA_CHECK(cudaFree(out_pi));
+    CUDA_CHECK(cudaFree(out_v));
 }
 
 static void gat_save_checkpoint(INeuralNet* self, const char* folder, const char* filename) {
@@ -302,17 +321,11 @@ INeuralNet* create_gat_model(const IGame* game) {
  * CUDA ERROR CHECKING
 **************************************************************************************************************************************************************/
 
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t error = call; \
-        if (error != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
-                    cudaGetErrorString(error)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
-/***************
- * **********************************************************************************************************************************************
+#define CUDNN_CHECK(call) { cudnnStatus_t status = call; if (status != CUDNN_STATUS_SUCCESS) { fprintf(stderr, "CUDNN error at %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(status)); exit(1); } }
+#define CUDA_CHECK(call) { cudaError_t status = call; if (status != cudaSuccess) { fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); exit(1); } }
+#define CURAND_CHECK(call) { curandStatus_t status = call; if (status != CURAND_STATUS_SUCCESS) { fprintf(stderr, "CURAND error at %s:%d: %d\n", __FILE__, __LINE__, status); exit(1); } }
+
+/*************************************************************************************************************************************************************
  * INIT HELPER FUNCTIONS
 **************************************************************************************************************************************************************/
 
@@ -335,12 +348,12 @@ static void init_model_config(GATModel* model, const IGame* game) {
 }
 
 static void init_input_block(GATModel* model) {
-    cudnnCreateTensorDescriptor(&model->input_descriptor);
-    cudnnSetTensor4dDescriptor(model->input_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                               model->config.batch_size, 1, model->config.max_nodes, model->config.input_features);
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&model->input_descriptor));
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(model->input_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                               model->config.batch_size, 1, model->config.max_nodes, model->config.input_features));
 
-    cudaMalloc(&model->input_weights, sizeof(float) * model->config.input_features * model->config.hidden_features);
-    cudaMalloc(&model->input_bias, sizeof(float) * model->config.hidden_features);
+    CUDA_CHECK(cudaMalloc(&model->input_weights, sizeof(float) * model->config.input_features * model->config.hidden_features));
+    CUDA_CHECK(cudaMalloc(&model->input_bias, sizeof(float) * model->config.hidden_features));
 }
 
 static void init_gat_layers(GATModel* model) {
@@ -349,55 +362,60 @@ static void init_gat_layers(GATModel* model) {
     model->layer_biases = (float**)malloc(model->config.num_layers * sizeof(float*));
     model->attention_weights = (float**)malloc(model->config.num_layers * sizeof(float*));
 
-    for (int i = 0; i < model->config.num_layers; i++) {
-        cudnnCreateTensorDescriptor(&model->layer_descriptors[i]);
-        cudnnSetTensor4dDescriptor(model->layer_descriptors[i], CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                                   model->config.batch_size, model->config.num_heads, model->config.max_nodes, model->config.hidden_features);
+    if (!model->layer_descriptors || !model->layer_weights || !model->layer_biases || !model->attention_weights) {
+        fprintf(stderr, "Memory allocation failed in init_gat_layers\n");
+        exit(1);
+    }
 
-        cudaMalloc(&model->layer_weights[i], sizeof(float) * model->config.hidden_features * model->config.hidden_features);
-        cudaMalloc(&model->layer_biases[i], sizeof(float) * model->config.hidden_features);
-        cudaMalloc(&model->attention_weights[i], sizeof(float) * model->config.num_heads * 2 * model->config.hidden_features);
+    for (int i = 0; i < model->config.num_layers; i++) {
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&model->layer_descriptors[i]));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(model->layer_descriptors[i], CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                   model->config.batch_size, model->config.num_heads, model->config.max_nodes, model->config.hidden_features));
+
+        CUDA_CHECK(cudaMalloc(&model->layer_weights[i], sizeof(float) * model->config.hidden_features * model->config.hidden_features));
+        CUDA_CHECK(cudaMalloc(&model->layer_biases[i], sizeof(float) * model->config.hidden_features));
+        CUDA_CHECK(cudaMalloc(&model->attention_weights[i], sizeof(float) * model->config.num_heads * 2 * model->config.hidden_features));
     }
 }
 
 static void init_output_block(GATModel* model) {
-    cudnnCreateTensorDescriptor(&model->value_descriptor);
-    cudnnCreateTensorDescriptor(&model->policy_descriptor);
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&model->value_descriptor));
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&model->policy_descriptor));
 
-    cudnnSetTensor4dDescriptor(model->value_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                               model->config.batch_size, 1, 1, model->config.hidden_features);
-    cudnnSetTensor4dDescriptor(model->policy_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                               model->config.batch_size, 1, 1, model->config.num_actions);
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(model->value_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                               model->config.batch_size, 1, 1, model->config.hidden_features));
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(model->policy_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                               model->config.batch_size, 1, 1, model->config.num_actions));
 
-    cudaMalloc(&model->value_weights, sizeof(float) * model->config.hidden_features);
-    cudaMalloc(&model->value_bias, sizeof(float));
-    cudaMalloc(&model->policy_weights, sizeof(float) * model->config.hidden_features * model->config.num_actions);
-    cudaMalloc(&model->policy_bias, sizeof(float) * model->config.num_actions);
+    CUDA_CHECK(cudaMalloc(&model->value_weights, sizeof(float) * model->config.hidden_features));
+    CUDA_CHECK(cudaMalloc(&model->value_bias, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&model->policy_weights, sizeof(float) * model->config.hidden_features * model->config.num_actions));
+    CUDA_CHECK(cudaMalloc(&model->policy_bias, sizeof(float) * model->config.num_actions));
 }
 
 static void init_weights(GATModel* model) {
     curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, time(NULL));
+    CURAND_CHECK(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
+    CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gen, time(NULL)));
 
     // Initialize input weights
-    curandGenerateNormal(gen, model->input_weights, model->config.input_features * model->config.hidden_features, 0, 0.1);
-    curandGenerateNormal(gen, model->input_bias, model->config.hidden_features, 0, 0.1);
+    CURAND_CHECK(curandGenerateNormal(gen, model->input_weights, model->config.input_features * model->config.hidden_features, 0, 0.1));
+    CURAND_CHECK(curandGenerateNormal(gen, model->input_bias, model->config.hidden_features, 0, 0.1));
 
     // Initialize GAT layer weights
     for (int i = 0; i < model->config.num_layers; i++) {
-        curandGenerateNormal(gen, model->layer_weights[i], model->config.hidden_features * model->config.hidden_features, 0, 0.1);
-        curandGenerateNormal(gen, model->layer_biases[i], model->config.hidden_features, 0, 0.1);
-        curandGenerateNormal(gen, model->attention_weights[i], model->config.num_heads * 2 * model->config.hidden_features, 0, 0.1);
+        CURAND_CHECK(curandGenerateNormal(gen, model->layer_weights[i], model->config.hidden_features * model->config.hidden_features, 0, 0.1));
+        CURAND_CHECK(curandGenerateNormal(gen, model->layer_biases[i], model->config.hidden_features, 0, 0.1));
+        CURAND_CHECK(curandGenerateNormal(gen, model->attention_weights[i], model->config.num_heads * 2 * model->config.hidden_features, 0, 0.1));
     }
 
     // Initialize output weights
-    curandGenerateNormal(gen, model->value_weights, model->config.hidden_features, 0, 0.1);
-    curandGenerateNormal(gen, model->value_bias, 1, 0, 0.1);
-    curandGenerateNormal(gen, model->policy_weights, model->config.hidden_features * model->config.num_actions, 0, 0.1);
-    curandGenerateNormal(gen, model->policy_bias, model->config.num_actions, 0, 0.1);
+    CURAND_CHECK(curandGenerateNormal(gen, model->value_weights, model->config.hidden_features, 0, 0.1));
+    CURAND_CHECK(curandGenerateNormal(gen, model->value_bias, 1, 0, 0.1));
+    CURAND_CHECK(curandGenerateNormal(gen, model->policy_weights, model->config.hidden_features * model->config.num_actions, 0, 0.1));
+    CURAND_CHECK(curandGenerateNormal(gen, model->policy_bias, model->config.num_actions, 0, 0.1));
 
-    curandDestroyGenerator(gen);
+    CURAND_CHECK(curandDestroyGenerator(gen));
 }
 
 /*************************************************************************************************************************************************************
@@ -406,27 +424,30 @@ static void init_weights(GATModel* model) {
 
 // Helper function to prepare batch data
 static void prepare_batch(TrainingExample* examples, int num_examples, int batch_size,
-                          float** batch_boards, float** batch_pis, float** batch_vs) {
-    cudaMalloc(batch_boards, batch_size * sizeof(float) * MAX_NODES * MAX_FEATURES);
-    cudaMalloc(batch_pis, batch_size * sizeof(float) * NUM_ACTIONS);
-    cudaMalloc(batch_vs, batch_size * sizeof(float));
+                          float* batch_boards, float* batch_pis, float* batch_vs) {
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     // Use cuRAND for random selection
     curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, time(NULL));
+    CURAND_CHECK(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
+    CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gen, time(NULL)));
 
     int* d_indices;
-    cudaMalloc(&d_indices, batch_size * sizeof(int));
-    curandGenerate(gen, (unsigned int*)d_indices, batch_size);
+    CUDA_CHECK(cudaMalloc(&d_indices, batch_size * sizeof(int)));
+    CURAND_CHECK(curandGenerate(gen, (unsigned int*)d_indices, batch_size));
 
     // Custom CUDA kernel to prepare batch
     dim3 grid((batch_size + 255) / 256);
     dim3 block(256);
-    prepare_batch_kernel<<<grid, block>>>(examples, num_examples, d_indices, *batch_boards, *batch_pis, *batch_vs, batch_size);
+    prepare_batch_kernel<<<grid, block>>>(examples, num_examples, d_indices, batch_boards, batch_pis, batch_vs, batch_size);
+    CUDA_CHECK(cudaGetLastError());
 
-    cudaFree(d_indices);
-    curandDestroyGenerator(gen);
+    CUDA_CHECK(cudaFree(d_indices));
+    CURAND_CHECK(curandDestroyGenerator(gen));
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    printf("Batch preparation took %lld microseconds\n", duration.count());
 }
 
 // CUDA kernel for batch preparation
@@ -443,17 +464,19 @@ __global__ void prepare_batch_kernel(TrainingExample* examples, int num_examples
 
 // Helper function for forward pass
 static void forward_gat(GATModel* model, float* batch_boards, float** out_pi, float** out_v) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     cudnnHandle_t cudnn = model->cudnn_handle;
     cublasHandle_t cublas;
-    cublasCreate(&cublas);
+    CUDA_CHECK(cublasCreate(&cublas));
 
     float alpha = 1.0f, beta = 0.0f;
     
     // Input layer
-    cudnnConvolutionForward(cudnn, &alpha, model->input_descriptor, batch_boards,
+    CUDA_CHECK(cudnnConvolutionForward(cudnn, &alpha, model->input_descriptor, batch_boards,
                             model->input_filter, model->input_weights,
                             model->conv_descriptor, CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
-                            model->workspace, model->workspace_size, &beta, model->layer_descriptors[0], model->layer_outputs[0]);
+                            model->workspace, model->workspace_size, &beta, model->layer_descriptors[0], model->layer_outputs[0]));
 
     // GAT layers
     for (int i = 0; i < model->config.num_layers; i++) {
@@ -463,52 +486,63 @@ static void forward_gat(GATModel* model, float* batch_boards, float** out_pi, fl
         compute_attention<<<grid, block>>>(model->layer_outputs[i], model->attention_weights[i], 
                                            model->attention_scores[i], model->config.max_nodes, 
                                            model->config.hidden_features, model->config.num_heads);
+        CUDA_CHECK(cudaGetLastError());
 
         // Apply attention (custom CUDA kernel)
         apply_attention<<<grid, block>>>(model->layer_outputs[i], model->attention_scores[i], 
                                          model->layer_outputs[i+1], model->config.max_nodes, 
                                          model->config.hidden_features, model->config.num_heads);
+        CUDA_CHECK(cudaGetLastError());
 
         // Linear transformation
-        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+        CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                     model->config.hidden_features, model->config.max_nodes, model->config.hidden_features,
                     &alpha, model->layer_weights[i], model->config.hidden_features,
                     model->layer_outputs[i+1], model->config.hidden_features,
-                    &beta, model->layer_outputs[i+1], model->config.hidden_features);
+                    &beta, model->layer_outputs[i+1], model->config.hidden_features));
 
         // Add bias and apply activation (custom CUDA kernel)
         add_bias_activate<<<grid, block>>>(model->layer_outputs[i+1], model->layer_biases[i], 
                                            model->config.max_nodes, model->config.hidden_features);
+        CUDA_CHECK(cudaGetLastError());
     }
 
     // Output layer
-    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+    CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                 model->config.num_actions, model->config.batch_size, model->config.hidden_features,
                 &alpha, model->policy_weights, model->config.num_actions,
                 model->layer_outputs[model->config.num_layers], model->config.hidden_features,
-                &beta, *out_pi, model->config.num_actions);
+                &beta, *out_pi, model->config.num_actions));
 
-    cublasSgemv(cublas, CUBLAS_OP_N,
+    CUDA_CHECK(cublasSgemv(cublas, CUBLAS_OP_N,
                 1, model->config.hidden_features,
                 &alpha, model->value_weights, 1,
                 model->layer_outputs[model->config.num_layers], 1,
-                &beta, *out_v, 1);
+                &beta, *out_v, 1));
 
     // Apply softmax to policy output (custom CUDA kernel)
     dim3 grid_policy((model->config.num_actions + 255) / 256, model->config.batch_size);
     dim3 block_policy(256);
     softmax<<<grid_policy, block_policy>>>(*out_pi, model->config.num_actions);
+    CUDA_CHECK(cudaGetLastError());
 
     // Apply tanh to value output (custom CUDA kernel)
     dim3 grid_value((model->config.batch_size + 255) / 256);
     dim3 block_value(256);
     tanh_activate<<<grid_value, block_value>>>(*out_v, model->config.batch_size);
+    CUDA_CHECK(cudaGetLastError());
 
-    cublasDestroy(cublas);
+    CUDA_CHECK(cublasDestroy(cublas));
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    printf("Forward pass took %lld microseconds\n", duration.count());
 }
 
 // Helper function to compute losses
 static std::pair<float, float> compute_losses(float* target_pi, float* target_v, float* out_pi, float* out_v, int batch_size, int action_size) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     // Use PyTorch for loss computation
     auto target_pi_tensor = torch::from_blob(target_pi, {batch_size, action_size}, torch::kFloat32);
     auto target_v_tensor = torch::from_blob(target_v, {batch_size}, torch::kFloat32);
@@ -518,43 +552,48 @@ static std::pair<float, float> compute_losses(float* target_pi, float* target_v,
     auto pi_loss = torch::nn::functional::kl_div(out_pi_tensor.log(), target_pi_tensor, torch::Reduction::Sum);
     auto v_loss = torch::mse_loss(out_v_tensor, target_v_tensor, torch::Reduction::Sum);
 
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    printf("Loss computation took %lld microseconds\n", duration.count());
+
     return {pi_loss.item<float>() / batch_size, v_loss.item<float>() / batch_size};
 }
 
-#include <cudnn.h>
-#include <cublas_v2.h>
-
 static void backward_gat(GATModel* model, float* batch_boards, float* target_pi, float* target_v, float* out_pi, float* out_v) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     cudnnHandle_t cudnn = model->cudnn_handle;
     cublasHandle_t cublas;
-    cublasCreate(&cublas);
+    CUDA_CHECK(cublasCreate(&cublas));
 
     float alpha = 1.0f, beta = 0.0f;
 
     // Compute gradients for policy and value heads
     float* d_policy, *d_value;
-    cudaMalloc(&d_policy, model->config.batch_size * model->config.num_actions * sizeof(float));
-    cudaMalloc(&d_value, model->config.batch_size * sizeof(float));
+    CUDA_CHECK(cudaMalloc(&d_policy, model->config.batch_size * model->config.num_actions * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_value, model->config.batch_size * sizeof(float)));
 
     // Policy loss gradient
     softmax_cross_entropy_gradient<<<(model->config.num_actions + 255) / 256, 256>>>(
         out_pi, target_pi, d_policy, model->config.batch_size, model->config.num_actions);
+    CUDA_CHECK(cudaGetLastError());
 
     // Value loss gradient
     mse_gradient<<<(model->config.batch_size + 255) / 256, 256>>>(
         out_v, target_v, d_value, model->config.batch_size);
+    CUDA_CHECK(cudaGetLastError());
 
     // Backpropagate through output layer
-    cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+    CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                 model->config.hidden_features, model->config.batch_size, model->config.num_actions,
                 &alpha, model->policy_weights, model->config.num_actions,
                 d_policy, model->config.num_actions,
-                &beta, model->d_last_layer, model->config.hidden_features);
+                &beta, model->d_last_layer, model->config.hidden_features));
 
-    cublasSger(cublas, model->config.hidden_features, model->config.batch_size,
+    CUDA_CHECK(cublasSger(cublas, model->config.hidden_features, model->config.batch_size,
                &alpha, model->value_weights, 1,
                d_value, 1,
-               model->d_last_layer, model->config.hidden_features);
+               model->d_last_layer, model->config.hidden_features));
 
     // Backpropagate through GAT layers
     for (int i = model->config.num_layers - 1; i >= 0; i--) {
@@ -563,52 +602,58 @@ static void backward_gat(GATModel* model, float* batch_boards, float* target_pi,
             model->layer_outputs[i], model->attention_scores[i], model->d_last_layer,
             model->d_attention_weights[i], model->d_layer_outputs[i],
             model->config.max_nodes, model->config.hidden_features, model->config.num_heads);
+        CUDA_CHECK(cudaGetLastError());
 
         // Backpropagate through linear transformation
-        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+        CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
                     model->config.hidden_features, model->config.hidden_features, model->config.max_nodes,
                     &alpha, model->d_layer_outputs[i], model->config.hidden_features,
                     model->layer_weights[i], model->config.hidden_features,
-                    &beta, model->d_last_layer, model->config.hidden_features);
+                    &beta, model->d_last_layer, model->config.hidden_features));
 
-        cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+        CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                     model->config.hidden_features, model->config.max_nodes, model->config.hidden_features,
                     &alpha, model->layer_weights[i], model->config.hidden_features,
                     model->d_layer_outputs[i], model->config.hidden_features,
-                    &beta, model->d_layer_weights[i], model->config.hidden_features);
+                    &beta, model->d_layer_weights[i], model->config.hidden_features));
 
         // Compute gradient for biases
-        cublasSgemv(cublas, CUBLAS_OP_N,
+        CUDA_CHECK(cublasSgemv(cublas, CUBLAS_OP_N,
                     model->config.hidden_features, model->config.max_nodes,
                     &alpha, model->d_layer_outputs[i], model->config.hidden_features,
                     model->ones, 1,
-                    &beta, model->d_layer_biases[i], 1);
+                    &beta, model->d_layer_biases[i], 1));
 
         // Backpropagate activation function
         backward_activation<<<(model->config.max_nodes * model->config.hidden_features + 255) / 256, 256>>>(
             model->layer_outputs[i], model->d_last_layer,
             model->config.max_nodes * model->config.hidden_features);
+        CUDA_CHECK(cudaGetLastError());
     }
 
     // Backpropagate through input layer
-    cudnnConvolutionBackwardFilter(cudnn, &alpha,
+    CUDA_CHECK(cudnnConvolutionBackwardFilter(cudnn, &alpha,
                                    model->input_descriptor, batch_boards,
                                    model->layer_descriptors[0], model->d_last_layer,
                                    model->conv_descriptor, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0,
                                    model->workspace, model->workspace_size,
-                                   &beta, model->input_filter, model->d_input_weights);
+                                   &beta, model->input_filter, model->d_input_weights));
 
-    cudnnConvolutionBackwardData(cudnn, &alpha,
+    CUDA_CHECK(cudnnConvolutionBackwardData(cudnn, &alpha,
                                  model->input_filter, model->input_weights,
                                  model->layer_descriptors[0], model->d_last_layer,
                                  model->conv_descriptor, CUDNN_CONVOLUTION_BWD_DATA_ALGO_0,
                                  model->workspace, model->workspace_size,
-                                 &beta, model->input_descriptor, model->d_input_data);
+                                 &beta, model->input_descriptor, model->d_input_data));
 
     // Clean up
-    cudaFree(d_policy);
-    cudaFree(d_value);
-    cublasDestroy(cublas);
+    CUDA_CHECK(cudaFree(d_policy));
+    CUDA_CHECK(cudaFree(d_value));
+    CUDA_CHECK(cublasDestroy(cublas));
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    printf("Backward pass took %lld microseconds\n", duration.count());
 }
 
 // Custom CUDA kernel implementations
@@ -651,7 +696,8 @@ __global__ void add_bias_activate(float* outputs, float* biases, int num_nodes, 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_nodes * hidden_size) {
         int feature_idx = idx % hidden_size;
-        outputs[idx] = max(0.0f, outputs[idx] + biases[feature_idx]);  // ReLU activation
+        float x = outputs[idx] + biases[feature_idx];
+        outputs[idx] = x > 0.0f ? x : 0.2f * x;  // LeakyReLU activation with alpha = 0.2
     }
 }
 
@@ -718,6 +764,6 @@ __global__ void backward_attention(float* inputs, float* scores, float* grad_out
 __global__ void backward_activation(float* inputs, float* grad_output, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        grad_output[idx] *= (inputs[idx] > 0.0f) ? 1.0f : 0.0f;  // ReLU gradient
+        grad_output[idx] *= (inputs[idx] > 0.0f) ? 1.0f : 0.2f;  // LeakyReLU gradient
     }
 }
