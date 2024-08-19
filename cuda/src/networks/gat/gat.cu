@@ -185,7 +185,11 @@ static void gat_save_checkpoint(INeuralNet* self, const char* folder, const char
     // Save optimizer state
     archive.write("optimizer", model->optimizer->state_dict());
 
-    torch::serialize::save_to_file(archive, filepath);
+    try {
+        torch::serialize::save_to_file(archive, filepath);
+    } catch (const c10::Error& e) {
+        fprintf(stderr, "Error saving checkpoint: %s\n", e.what());
+    }
 }
 
 static void gat_load_checkpoint(INeuralNet* self, const char* folder, const char* filename) {
@@ -196,24 +200,26 @@ static void gat_load_checkpoint(INeuralNet* self, const char* folder, const char
     snprintf(filepath, MAX_FILENAME_LENGTH, "%s/%s", folder, filename);
 
     torch::serialize::InputArchive archive;
-    torch::serialize::load_from_file(archive, filepath);
+    try {
+        torch::serialize::load_from_file(archive, filepath);
+    } catch (const c10::Error& e) {
+        fprintf(stderr, "Error loading checkpoint: %s\n", e.what());
+        return;
+    }
 
     // Load model configuration
     torch::Tensor config_tensor;
     archive.read("config", config_tensor);
     memcpy(&model->config, config_tensor.data_ptr(), sizeof(ModelConfig));
 
-    // Reallocate memory if necessary (in case the loaded model has different dimensions)
-    // This part is omitted for brevity, but you should implement it in a production environment
-
     // Load input block weights
     torch::Tensor input_weights, input_bias;
     archive.read("input_weights", input_weights);
     archive.read("input_bias", input_bias);
-    cudaMemcpy(model->input_weights, input_weights.data_ptr(), 
-        input_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(model->input_bias, input_bias.data_ptr(), 
-        input_bias.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
+    CUDA_CHECK(cudaMemcpy(model->input_weights, input_weights.data_ptr(), 
+        input_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(model->input_bias, input_bias.data_ptr(), 
+        input_bias.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
 
     // Load GAT layer weights
     for (int i = 0; i < model->config.num_layers; i++) {
@@ -222,18 +228,18 @@ static void gat_load_checkpoint(INeuralNet* self, const char* folder, const char
         
         snprintf(key, sizeof(key), "layer_weights_%d", i);
         archive.read(key, layer_weights);
-        cudaMemcpy(model->layer_weights[i], layer_weights.data_ptr(), 
-            layer_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
+        CUDA_CHECK(cudaMemcpy(model->layer_weights[i], layer_weights.data_ptr(), 
+            layer_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
         
         snprintf(key, sizeof(key), "layer_biases_%d", i);
         archive.read(key, layer_biases);
-        cudaMemcpy(model->layer_biases[i], layer_biases.data_ptr(), 
-            layer_biases.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
+        CUDA_CHECK(cudaMemcpy(model->layer_biases[i], layer_biases.data_ptr(), 
+            layer_biases.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
         
         snprintf(key, sizeof(key), "attention_weights_%d", i);
         archive.read(key, attention_weights);
-        cudaMemcpy(model->attention_weights[i], attention_weights.data_ptr(), 
-            attention_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
+        CUDA_CHECK(cudaMemcpy(model->attention_weights[i], attention_weights.data_ptr(), 
+            attention_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
     }
 
     // Load output block weights
@@ -242,14 +248,14 @@ static void gat_load_checkpoint(INeuralNet* self, const char* folder, const char
     archive.read("value_bias", value_bias);
     archive.read("policy_weights", policy_weights);
     archive.read("policy_bias", policy_bias);
-    cudaMemcpy(model->value_weights, value_weights.data_ptr(), 
-        value_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(model->value_bias, value_bias.data_ptr(), 
-        value_bias.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(model->policy_weights, policy_weights.data_ptr(), 
-        policy_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(model->policy_bias, policy_bias.data_ptr(), 
-        policy_bias.numel() * sizeof(float), cudaMemcpyDeviceToDevice);
+    CUDA_CHECK(cudaMemcpy(model->value_weights, value_weights.data_ptr(), 
+        value_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(model->value_bias, value_bias.data_ptr(), 
+        value_bias.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(model->policy_weights, policy_weights.data_ptr(), 
+        policy_weights.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(model->policy_bias, policy_bias.data_ptr(), 
+        policy_bias.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
 
     // Load optimizer state
     torch::serialize::OutputArchive optimizer_archive;
@@ -257,18 +263,18 @@ static void gat_load_checkpoint(INeuralNet* self, const char* folder, const char
     model->optimizer->load_state_dict(optimizer_archive);
 
     // Recreate cuDNN descriptors
-    cudnnSetTensor4dDescriptor(model->input_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                               model->config.batch_size, 1, model->config.max_nodes, model->config.input_features);
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(model->input_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                               model->config.batch_size, 1, model->config.max_nodes, model->config.input_features));
 
     for (int i = 0; i < model->config.num_layers; i++) {
-        cudnnSetTensor4dDescriptor(model->layer_descriptors[i], CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                                   model->config.batch_size, model->config.num_heads, model->config.max_nodes, model->config.hidden_features);
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(model->layer_descriptors[i], CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                   model->config.batch_size, model->config.num_heads, model->config.max_nodes, model->config.hidden_features));
     }
 
-    cudnnSetTensor4dDescriptor(model->value_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                               model->config.batch_size, 1, 1, model->config.hidden_features);
-    cudnnSetTensor4dDescriptor(model->policy_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                               model->config.batch_size, 1, 1, model->config.num_actions);
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(model->value_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                               model->config.batch_size, 1, 1, model->config.hidden_features));
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(model->policy_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                               model->config.batch_size, 1, 1, model->config.num_actions));
 }
 
 static void gat_destroy(INeuralNet* self) {
@@ -276,16 +282,16 @@ static void gat_destroy(INeuralNet* self) {
     GATModel* model = &wrapper->model;
 
     // Free input block resources
-    cudnnDestroyTensorDescriptor(model->input_descriptor);
-    cudaFree(model->input_weights);
-    cudaFree(model->input_bias);
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(model->input_descriptor));
+    CUDA_CHECK(cudaFree(model->input_weights));
+    CUDA_CHECK(cudaFree(model->input_bias));
 
     // Free GAT layer resources
     for (int i = 0; i < model->config.num_layers; i++) {
-        cudnnDestroyTensorDescriptor(model->layer_descriptors[i]);
-        cudaFree(model->layer_weights[i]);
-        cudaFree(model->layer_biases[i]);
-        cudaFree(model->attention_weights[i]);
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(model->layer_descriptors[i]));
+        CUDA_CHECK(cudaFree(model->layer_weights[i]));
+        CUDA_CHECK(cudaFree(model->layer_biases[i]));
+        CUDA_CHECK(cudaFree(model->attention_weights[i]));
     }
     free(model->layer_descriptors);
     free(model->layer_weights);
@@ -293,18 +299,18 @@ static void gat_destroy(INeuralNet* self) {
     free(model->attention_weights);
 
     // Free output block resources
-    cudnnDestroyTensorDescriptor(model->value_descriptor);
-    cudnnDestroyTensorDescriptor(model->policy_descriptor);
-    cudaFree(model->value_weights);
-    cudaFree(model->value_bias);
-    cudaFree(model->policy_weights);
-    cudaFree(model->policy_bias);
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(model->value_descriptor));
+    CUDNN_CHECK(cudnnDestroyTensorDescriptor(model->policy_descriptor));
+    CUDA_CHECK(cudaFree(model->value_weights));
+    CUDA_CHECK(cudaFree(model->value_bias));
+    CUDA_CHECK(cudaFree(model->policy_weights));
+    CUDA_CHECK(cudaFree(model->policy_bias));
 
     // Free cuDNN workspace
-    cudaFree(model->workspace);
+    CUDA_CHECK(cudaFree(model->workspace));
 
     // Destroy cuDNN handle
-    cudnnDestroy(model->cudnn_handle);
+    CUDNN_CHECK(cudnnDestroy(model->cudnn_handle));
 
     // Delete PyTorch optimizer
     delete model->optimizer;
