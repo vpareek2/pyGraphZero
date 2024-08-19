@@ -139,6 +139,57 @@ static void gat_train(INeuralNet* self, TrainingExample* examples, int num_examp
     CUDA_CHECK(cudaFree(out_v));
 }
 
+static void gat_predict(INeuralNet* self, const float* board, float* pi, float* v) {
+    GATWrapper* wrapper = (GATWrapper*)self;
+    GATModel* model = &wrapper->model;
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+
+    // Allocate device memory for input and output
+    float *d_board, *d_pi, *d_v;
+    CUDA_CHECK(cudaMalloc(&d_board, sizeof(float) * model->config.input_features * model->config.board_size));
+    CUDA_CHECK(cudaMalloc(&d_pi, sizeof(float) * model->config.num_actions));
+    CUDA_CHECK(cudaMalloc(&d_v, sizeof(float)));
+
+    // Copy input to device
+    CUDA_CHECK(cudaMemcpyAsync(d_board, board, sizeof(float) * model->config.input_features * model->config.board_size, cudaMemcpyHostToDevice));
+
+    // Forward pass
+    forward_gat(model, d_board, &d_pi, &d_v);
+
+    // Apply softmax to policy output (on GPU)
+    dim3 grid_policy((model->config.num_actions + 255) / 256);
+    dim3 block_policy(256);
+    softmax<<<grid_policy, block_policy>>>(d_pi, model->config.num_actions);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Apply tanh to value output (on GPU)
+    tanh_activate<<<1, 1>>>(d_v, 1);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Copy output back to host
+    CUDA_CHECK(cudaMemcpyAsync(pi, d_pi, sizeof(float) * model->config.num_actions, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(v, d_v, sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Free device memory
+    CUDA_CHECK(cudaFree(d_board));
+    CUDA_CHECK(cudaFree(d_pi));
+    CUDA_CHECK(cudaFree(d_v));
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+    printf("Prediction time: %f ms\n", milliseconds);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+}
+
+
 static void gat_save_checkpoint(INeuralNet* self, const char* folder, const char* filename) {
     GATWrapper* wrapper = (GATWrapper*)self;
     GATModel* model = &wrapper->model;
@@ -711,22 +762,40 @@ __global__ void add_bias_activate(float* outputs, float* biases, int num_nodes, 
 }
 
 __global__ void softmax(float* inputs, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        float max_val = inputs[idx * size];
-        for (int i = 1; i < size; i++) {
-            max_val = max(max_val, inputs[idx * size + i]);
+    extern __shared__ float shared_data[];
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float local_max = (gid < size) ? inputs[gid] : -INFINITY;
+    
+    // Reduce to find max value
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_data[tid] = max(local_max, shared_data[tid + stride]);
         }
-        
-        float sum = 0.0f;
-        for (int i = 0; i < size; i++) {
-            inputs[idx * size + i] = exp(inputs[idx * size + i] - max_val);
-            sum += inputs[idx * size + i];
+        __syncthreads();
+    }
+    float max_val = shared_data[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    if (gid < size) {
+        inputs[gid] = exp(inputs[gid] - max_val);
+        local_sum = inputs[gid];
+    }
+
+    // Reduce to find sum
+    shared_data[tid] = local_sum;
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_data[tid] += shared_data[tid + stride];
         }
-        
-        for (int i = 0; i < size; i++) {
-            inputs[idx * size + i] /= sum;
-        }
+        __syncthreads();
+    }
+    float sum = shared_data[0];
+
+    if (gid < size) {
+        inputs[gid] /= sum;
     }
 }
 
