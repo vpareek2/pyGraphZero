@@ -1,3 +1,5 @@
+// TODO: Predict function, fix training function make it better and make sure everything is used correct
+
 #include "gat.cuh"
 
 #include <curand.h>
@@ -297,9 +299,22 @@ INeuralNet* create_gat_model(const IGame* game) {
 }
 
 /*************************************************************************************************************************************************************
- * INIT HELPER FUNCTIONS
+ * CUDA ERROR CHECKING
 **************************************************************************************************************************************************************/
 
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t error = call; \
+        if (error != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudaGetErrorString(error)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+/***************
+ * **********************************************************************************************************************************************
+ * INIT HELPER FUNCTIONS
+**************************************************************************************************************************************************************/
 
 static void init_model_config(GATModel* model, const IGame* game) {
     int board_size = game->get_board_size(game);
