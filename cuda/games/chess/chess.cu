@@ -294,27 +294,103 @@ __host__ __device__ int chess_get_game_ended(const IGame* self, const int* board
     // Game hasn't ended
     return 0;
 }
-
-// Convert the board to a canonical form (e.g., always from white's perspective)
-__host__ __device__ void chess_get_canonical_form(const IGame* self, const int* board, int player, int* canonical_board);
+__host__ __device__ void chess_get_canonical_form(const IGame* self, const int* board, int player, int* canonical_board) {
+    if (player == WHITE) {
+        // If player is White, simply copy the board
+        for (int i = 0; i < CHESS_BOARD_SIZE; i++) {
+            canonical_board[i] = board[i];
+        }
+    } else {
+        // If player is Black, flip the board vertically and negate the pieces
+        for (int i = 0; i < CHESS_BOARD_SIZE; i++) {
+            int flipped_index = CHESS_BOARD_SIZE - 1 - i;
+            canonical_board[i] = -board[flipped_index];
+        }
+    }
+}
 
 // Heuristic evaluation of the board state (optional, can return 0 if not implemented)
-__host__ __device__ float chess_evaluate(const IGame* self, const int* board, int player);
-
+__host__ __device__ float chess_evaluate(const IGame* self, const int* board, int player) {
+    float score = 0;
+    for (int i = 0; i < CHESS_BOARD_SIZE; i++) {
+        int piece = board[i];
+        switch (abs(piece)) {
+            case PAWN:   score += 1.0f * (piece > 0 ? 1 : -1); break;
+            case KNIGHT: score += 3.0f * (piece > 0 ? 1 : -1); break;
+            case BISHOP: score += 3.0f * (piece > 0 ? 1 : -1); break;
+            case ROOK:   score += 5.0f * (piece > 0 ? 1 : -1); break;
+            case QUEEN:  score += 9.0f * (piece > 0 ? 1 : -1); break;
+        }
+    }
+    return score * player;
+}
 // Generate all symmetries of the board (rotations and reflections)
-void chess_get_symmetries(const IGame* self, const int* board, const float* pi, int (*symmetries)[MAX_BOARD_SIZE], float (*symmetries_pi)[MAX_BOARD_SIZE], int* num_symmetries);
+void chess_get_symmetries(const IGame* self, const int* board, const float* pi, int (*symmetries)[CHESS_BOARD_SIZE], float (*symmetries_pi)[CHESS_BOARD_SIZE * 73], int* num_symmetries) {
+    for (int i = 0; i < CHESS_BOARD_SIZE; i++) {
+        symmetries[0][i] = board[i];
+    }
+    for (int i = 0; i < CHESS_BOARD_SIZE * 73; i++) {
+        symmetries_pi[0][i] = pi[i];
+    }
+    *num_symmetries = 1;
+}
 
 // Convert the board state to a string representation
-void chess_string_representation(const IGame* self, const int* board, char* str, int str_size);
+void chess_string_representation(const IGame* self, const int* board, char* str, int str_size) {
+    const char* pieces = " PNBRQK pnbrqk";
+    int idx = 0;
+    for (int rank = 7; rank >= 0; rank--) {
+        idx += snprintf(str + idx, str_size - idx, "%d ", rank + 1);
+        for (int file = 0; file < 8; file++) {
+            int piece = board[rank * 8 + file];
+            str[idx++] = pieces[piece < 0 ? (6 - piece) : piece];
+            if (idx >= str_size - 1) goto end;
+            if (file < 7) str[idx++] = ' ';
+            if (idx >= str_size - 1) goto end;
+        }
+        if (rank > 0) {
+            str[idx++] = '\n';
+            if (idx >= str_size - 1) goto end;
+        }
+    }
+    idx += snprintf(str + idx, str_size - idx, "\n  a b c d e f g h");
+end:
+    str[idx] = '\0';
+}
 
 // Display the current board state (e.g., print to console)
-void chess_display(const IGame* self, const int* board);
+void chess_display(const IGame* self, const int* board) {
+    char str[256];
+    chess_string_representation(self, board, str, sizeof(str));
+    printf("%s\n", str);
+}
 
 // Create a new chess game instance
-ChessGame* create_chess_game();
+ChessGame* create_chess_game() {
+    ChessGame* game = (ChessGame*)malloc(sizeof(ChessGame));
+    if (!game) {
+        fprintf(stderr, "Failed to allocate memory for ChessGame\n");
+        return NULL;
+    }
+    game->base.init = chess_init;
+    game->base.get_init_board = chess_get_init_board;
+    game->base.get_board_size = chess_get_board_size;
+    game->base.get_action_size = chess_get_action_size;
+    game->base.get_next_state = chess_get_next_state;
+    game->base.get_valid_moves = chess_get_valid_moves;
+    game->base.get_game_ended = chess_get_game_ended;
+    game->base.get_canonical_form = chess_get_canonical_form;
+    game->base.evaluate = chess_evaluate;
+    chess_init(&game->base);
+    return game;
+}
 
 // Free resources associated with a chess game instance
-void destroy_chess_game(ChessGame* game);
+void destroy_chess_game(ChessGame* game) {
+    if (game) {
+        free(game);
+    }
+}
 
 /***************************************************
  * HELPERS
