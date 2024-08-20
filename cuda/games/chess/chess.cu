@@ -506,3 +506,9 @@ __host__ __device__ bool is_legal_move(const ChessBoard* board, int start, int e
 __host__ __device__ void make_move(ChessBoard* board, int start, int end);
 __host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player);
 __host__ __device__ bool can_castle_queenside(const ChessBoard* board, int player);
+
+__host__ __device__ U64 get_attacks(int piece, int square, U64 occupancy);
+__host__ __device__ U64 get_king_attacks(int square);
+__host__ __device__ U64 get_pawn_attacks(int square, int color);
+__host__ __device__ U64 get_knight_attacks(int square);
+__host__ __device__ U64 get_sliding_attacks(int piece, int square, U64 occupancy);
