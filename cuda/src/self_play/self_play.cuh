@@ -10,6 +10,9 @@
 #define MAX_BATCH_SIZE 1024
 #define MAX_NUM_GAMES 10000
 
+// To make sure that the cuda stuff doesnt throw an
+#define CUDA_CHECK(call) { cudaError_t status = call; if (status != cudaSuccess) { fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); exit(1); } }
+
 typedef struct {
     int numIters;
     int numEps;
