@@ -322,6 +322,37 @@ void load_train_examples(SelfPlayPipeline* pipeline) {
     fclose(file);
     printf("Training examples loaded from %s\n", filename);
 }
+int pit_against_previous_version(SelfPlayPipeline* pipeline) {
+    // Create a new neural network for the previous version
+    INeuralNet* pnet = pipeline->nnet->clone(pipeline->nnet);
+    
+    // Load the weights of the previous best model
+    char filename[256];
+    get_checkpoint_file(pipeline, pipeline->config.arenaCompare, filename);
+    pnet->load_checkpoint(pnet, filename);
+
+    // Create arena for the two networks to play against each other
+    Arena* arena = create_arena(pipeline->game, pipeline->nnet, pnet, pipeline->config.numMCTSSims);
+
+    // Play games between the two versions
+    int num_games = pipeline->config.arenaCompare;
+    int num_wins = 0;
+    for (int i = 0; i < num_games; i++) {
+        int result = play_game(arena);
+        if (result > 0) num_wins++;
+    }
+
+    // Clean up
+    destroy_arena(arena);
+    pnet->destroy(pnet);
+
+    // Return 1 if the new version wins more than 55% of games
+    return (num_wins > num_games * 0.55) ? 1 : 0;
+}
+
+void get_checkpoint_file(SelfPlayPipeline* pipeline, int iteration, char* filename) {
+    snprintf(filename, 256, "%s/checkpoint_%04d.pth.tar", pipeline->config.checkpoint, iteration);
+}
 
 // MCTS and action selection helpers
 
