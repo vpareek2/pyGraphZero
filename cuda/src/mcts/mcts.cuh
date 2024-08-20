@@ -36,8 +36,8 @@ int mcts_select_action(MCTSState* state, float temperature);
 void mcts_update_with_move(MCTSState* state, int action);
 
 // CUDA kernel functions
-__global__ void mcts_simulate_kernel(MCTSNode* nodes, int* board, int player, curandState* rng_states);
-__device__ float mcts_simulate(MCTSNode* node, int* board, int player, curandState* rng_state);
+__global__ void mcts_simulate_kernel(MCTSNode* nodes, int* board, int player, curandState* rng_states, IGame* game);
+__device__ float mcts_simulate(MCTSNode* node, int* board, int player, curandState* rng_state, IGame* game);
 __device__ MCTSNode* mcts_select(MCTSNode* node);
 __device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game);
 __device__ float mcts_evaluate(int* board, int player, IGame* game);
