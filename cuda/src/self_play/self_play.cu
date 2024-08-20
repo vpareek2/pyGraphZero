@@ -391,8 +391,6 @@ __device__ void mcts_simulate(MCTSNode* node, int* board, int player, curandStat
     }
 }
 
-// You'll need to implement the mcts_expand, mcts_select_uct, and mcts_backpropagate functions to complete the MCTS simulation. These functions will depend on your specific MCTS implementation and data structures.
-
 __device__ void mcts_get_policy(MCTSNode* node, float* policy, float temperature) {
     int action_size = node->num_children;
     float sum = 0.0f;
@@ -444,4 +442,53 @@ __device__ MCTSNode* mcts_move_to_child(MCTSNode* node, int action) {
     }
     // This should never happen if the action is valid
     return nullptr;
+}
+
+// Not sure if this is correct or not too
+
+__device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game) {
+    int action_size = game->get_action_size(game);
+    node->num_children = 0;
+
+    for (int action = 0; action < action_size; action++) {
+        if (game->is_valid_action(game, board, action)) {
+            MCTSNode* child = &node->children[node->num_children++];
+            child->action = action;
+            child->parent = node;
+            child->num_visits = 0;
+            child->Q = 0.0f;
+            child->P = 0.0f;
+        }
+    }
+}
+
+// Not sure if this is accurate or not too
+
+__device__ MCTSNode* mcts_select_uct(MCTSNode* node) {
+    MCTSNode* best_child = nullptr;
+    float best_uct = -1.0f;
+
+    for (int i = 0; i < node->num_children; i++) {
+        MCTSNode* child = &node->children[i];
+        float uct = child->Q + child->P * sqrtf(node->num_visits) / (1 + child->num_visits);
+        if (uct > best_uct) {
+            best_uct = uct;
+            best_child = child;
+        }
+    }
+
+    return best_child;
+}
+
+/*
+    Not sure if this is correct, I would've thought to use like mcts_backpropagate from the thing
+*/
+
+__device__ void mcts_backpropagate(MCTSNode* node, float value) {
+    while (node != nullptr) {
+        node->num_visits++;
+        node->Q += (value - node->Q) / node->num_visits;
+        value = -value;  // Switch perspective for the other player
+        node = node->parent;
+    }
 }

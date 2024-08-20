@@ -41,6 +41,7 @@ __global__ void mcts_simulate_kernel(MCTSNode* nodes, int* boards, int* players,
 __device__ float mcts_simulate(MCTSNode* node, int* board, int player, curandState* rng_state, IGame* game);
 __device__ MCTSNode* mcts_select(MCTSNode* node);
 __device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game);
+// ???
 __device__ float mcts_evaluate(int* board, int player, IGame* game);
 __device__ void mcts_backpropagate(MCTSNode* node, float value);
 

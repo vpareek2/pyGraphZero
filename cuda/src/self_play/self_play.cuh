@@ -85,5 +85,9 @@ __device__ void mcts_simulate(MCTSNode* node, int* board, int player, curandStat
 __device__ void mcts_get_policy(MCTSNode* node, float* policy, float temperature);
 __device__ int select_action(float* policy, int action_size, curandState* rng_state);
 __device__ MCTSNode* mcts_move_to_child(MCTSNode* node, int action);
+__device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game);
+__device__ MCTSNode* mcts_select_uct(MCTSNode* node);
+
+
 
 #endif // SELF_PLAY_CUH
