@@ -24,7 +24,7 @@
 typedef struct {
     int pieces[CHESS_BOARD_SIZE];
     int player;
-    bool castling_rights[2][2];  // [player][kingside/queenside]
+    bool castling_rights[2][2]; // [player][kingside/queenside]
     int en_passant_target;
     int halfmove_clock;
     int fullmove_number;
@@ -51,13 +51,18 @@ void chess_get_symmetries(const IGame* self, const int* board, const float* pi, 
 void chess_string_representation(const IGame* self, const int* board, char* str, int str_size);
 void chess_display(const IGame* self, const int* board);
 
-// Helper functions (implement as needed)
+// Helper functions
 __host__ __device__ bool is_check(const ChessBoard* board, int player);
 __host__ __device__ bool is_checkmate(const ChessBoard* board, int player);
 __host__ __device__ bool is_stalemate(const ChessBoard* board, int player);
 __host__ __device__ bool is_insufficient_material(const ChessBoard* board);
-__host__ __device__ bool is_threefold_repetition(const ChessBoard* board);
 __host__ __device__ bool is_fifty_move_rule(const ChessBoard* board);
+
+// New helper functions
+__host__ __device__ bool is_legal_move(const ChessBoard* board, int start, int end);
+__host__ __device__ void make_move(ChessBoard* board, int start, int end);
+__host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player);
+__host__ __device__ bool can_castle_queenside(const ChessBoard* board, int player);
 
 // Create and destroy functions
 ChessGame* create_chess_game();
