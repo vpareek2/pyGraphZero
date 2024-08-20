@@ -115,29 +115,31 @@ void mcts_apply_move(const IGame* game, int* board, int player, int action) {
 
 // CUDA kernel functions
 
-__global__ void mcts_simulate_kernel(MCTSNode* nodes, int* board, int player, curandState* rng_states, IGame* game) {
+__global__ void mcts_simulate_kernel(MCTSNode* nodes, int* boards, int* players, curandState* rng_states, IGame* game, int num_games) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid < NUM_SIMULATIONS) {
-        float value = mcts_simulate(&nodes[0], board, player, &rng_states[tid], game);
-        mcts_backpropagate(&nodes[0], value);
+    int gid = blockIdx.y;
+    if (tid < NUM_SIMULATIONS && gid < num_games) {
+        int offset = gid * MAX_BOARD_SIZE;
+        float value = mcts_simulate(&nodes[gid], &boards[offset], players[gid], &rng_states[tid + gid * NUM_SIMULATIONS], game);
+        mcts_backpropagate(&nodes[gid], value);
     }
 }
 
 __device__ float mcts_simulate(MCTSNode* node, int* board, int player, curandState* rng_state, IGame* game) {
-    if (game->get_game_ended(game, board, player) != 0) {
-        return -game->get_game_ended(game, board, player);
+    if (game->get_game_ended_cuda(game, board, player) != 0) {
+        return -game->get_game_ended_cuda(game, board, player);
     }
 
     if (node->num_children == 0) {
         mcts_expand(node, board, player, game);
-        return -mcts_evaluate(board, player, game);
+        return -game->evaluate_cuda(game, board, player);
     }
 
     MCTSNode* best_child = mcts_select(node);
     
     int next_board[MAX_BOARD_SIZE];
     int next_player;
-    game->get_next_state(game, board, player, best_child->action, next_board, &next_player);
+    game->get_next_state_cuda(game, board, player, best_child->action, next_board, &next_player);
     
     float value = -mcts_simulate(best_child, next_board, next_player, rng_state, game);
 
@@ -153,8 +155,8 @@ __device__ MCTSNode* mcts_select(MCTSNode* node) {
 
     for (int i = 0; i < node->num_children; i++) {
         MCTSNode* child = &node->children[i];
-        float q_value = child->value_sum / (child->visit_count + 1e-8);
-        float u_value = C_PUCT * sqrtf(__logf(node->visit_count + 1) / (child->visit_count + 1e-8));
+        float q_value = child->value_sum / (child->visit_count + 1e-8f);
+        float u_value = C_PUCT * sqrtf(__logf(node->visit_count + 1) / (child->visit_count + 1e-8f));
         float uct_value = q_value + u_value;
 
         if (uct_value > best_value) {
@@ -168,7 +170,7 @@ __device__ MCTSNode* mcts_select(MCTSNode* node) {
 
 __device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game) {
     bool valid_moves[MAX_BOARD_SIZE];
-    game->get_valid_moves(game, board, player, valid_moves);
+    game->get_valid_moves_cuda(game, board, player, valid_moves);
 
     int num_children = 0;
     for (int i = 0; i < game->get_action_size(game); i++) {
@@ -185,10 +187,6 @@ __device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game)
     node->num_children = num_children;
 }
 
-__device__ float mcts_evaluate(int* board, int player, IGame* game) {
-    return game->evaluate(game, board, player);
-}
-
 __device__ void mcts_backpropagate(MCTSNode* node, float value) {
     while (node != nullptr) {
         atomicAdd(&node->visit_count, 1);
@@ -200,51 +198,53 @@ __device__ void mcts_backpropagate(MCTSNode* node, float value) {
 
 // CUDA helper functions
 
-__global__ void init_rng(curandState* states, unsigned long seed) {
+__global__ void init_rng(curandState* states, unsigned long seed, int num_states) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid < NUM_SIMULATIONS) {
+    if (tid < num_states) {
         curand_init(seed, tid, 0, &states[tid]);
     }
 }
 
-// Function to run GPU simulations
-void mcts_run_simulations(MCTSState* state) {
+void mcts_run_batch(MCTSState** states, int num_games) {
     // Allocate GPU memory
     MCTSNode* d_nodes;
-    int* d_board;
+    int* d_boards;
+    int* d_players;
     curandState* d_rng_states;
     IGame* d_game;
 
-    cudaMalloc(&d_nodes, sizeof(MCTSNode) * MAX_CHILDREN);  // Assuming worst case: all children are expanded
-    cudaMalloc(&d_board, sizeof(int) * MAX_BOARD_SIZE);
-    cudaMalloc(&d_rng_states, sizeof(curandState) * NUM_SIMULATIONS);
+    cudaMalloc(&d_nodes, sizeof(MCTSNode) * num_games);
+    cudaMalloc(&d_boards, sizeof(int) * MAX_BOARD_SIZE * num_games);
+    cudaMalloc(&d_players, sizeof(int) * num_games);
+    cudaMalloc(&d_rng_states, sizeof(curandState) * NUM_SIMULATIONS * num_games);
     cudaMalloc(&d_game, sizeof(IGame));
 
     // Copy data to GPU
-    cudaMemcpy(d_nodes, state->root, sizeof(MCTSNode), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_board, state->root->board, sizeof(int) * MAX_BOARD_SIZE, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_game, state->game, sizeof(IGame), cudaMemcpyHostToDevice);
+    for (int i = 0; i < num_games; i++) {
+        cudaMemcpy(&d_nodes[i], states[i]->root, sizeof(MCTSNode), cudaMemcpyHostToDevice);
+        cudaMemcpy(&d_boards[i * MAX_BOARD_SIZE], states[i]->root->board, sizeof(int) * MAX_BOARD_SIZE, cudaMemcpyHostToDevice);
+        int player = states[i]->root->player;
+        cudaMemcpy(&d_players[i], &player, sizeof(int), cudaMemcpyHostToDevice);
+    }
+    cudaMemcpy(d_game, states[0]->game, sizeof(IGame), cudaMemcpyHostToDevice);
 
     // Initialize RNG states
-    init_rng<<<(NUM_SIMULATIONS + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(d_rng_states, time(NULL));
+    dim3 rng_grid((NUM_SIMULATIONS * num_games + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+    init_rng<<<rng_grid, THREADS_PER_BLOCK>>>(d_rng_states, time(NULL), NUM_SIMULATIONS * num_games);
 
     // Run simulations
-    mcts_simulate_kernel<<<(NUM_SIMULATIONS + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(d_nodes, d_board, state->root->player, d_rng_states, d_game);
+    dim3 sim_grid((NUM_SIMULATIONS + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, num_games);
+    mcts_simulate_kernel<<<sim_grid, THREADS_PER_BLOCK>>>(d_nodes, d_boards, d_players, d_rng_states, d_game, num_games);
 
     // Copy results back to CPU
-    cudaMemcpy(state->root, d_nodes, sizeof(MCTSNode), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < num_games; i++) {
+        cudaMemcpy(states[i]->root, &d_nodes[i], sizeof(MCTSNode), cudaMemcpyDeviceToHost);
+    }
 
     // Free GPU memory
     cudaFree(d_nodes);
-    cudaFree(d_board);
+    cudaFree(d_boards);
+    cudaFree(d_players);
     cudaFree(d_rng_states);
     cudaFree(d_game);
-}
-
-// Helper function to free a node and its children
-void mcts_free_node(MCTSNode* node) {
-    for (int i = 0; i < node->num_children; i++) {
-        mcts_free_node(node->children[i]);
-    }
-    delete node;
 }

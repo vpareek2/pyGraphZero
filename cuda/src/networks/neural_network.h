@@ -1,7 +1,7 @@
 #ifndef NEURAL_NETWORK_H
 #define NEURAL_NETWORK_H
 
-#include "../games/game.h"
+#include "../games/game.cuh"
 
 #define MAX_FILENAME_LENGTH 256
 

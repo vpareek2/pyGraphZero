@@ -3,7 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
-#include "../games/game.h"
+#include "../games/game.cuh"
 #include "../networks/neural_network.h"
 #include "../mcts/mcts.cuh"
 
