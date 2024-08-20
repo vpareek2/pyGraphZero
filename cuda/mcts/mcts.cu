@@ -189,9 +189,22 @@ __device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game)
 
 __device__ void mcts_backpropagate(MCTSNode* node, float value) {
     while (node != nullptr) {
-        atomicAdd(&node->visit_count, 1);
-        atomicAdd(&node->value_sum, value);
-        value = -value;
+        node->visit_count++;
+        node->value_sum += value;
+        
+        // Update Q value for the action that led to this node
+        if (node->parent != nullptr) {
+            for (int i = 0; i < node->parent->num_children; i++) {
+                if (node->parent->children[i] == node) {
+                    node->parent->N[i]++;
+                    node->parent->Q[i] = node->parent->Q[i] + 
+                        (value - node->parent->Q[i]) / node->parent->N[i];
+                    break;
+                }
+            }
+        }
+        
+        value = -value; // Switch perspective for the other player
         node = node->parent;
     }
 }

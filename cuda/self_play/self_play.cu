@@ -513,33 +513,37 @@ __device__ MCTSNode* mcts_move_to_child(MCTSNode* node, int action) {
     return nullptr;
 }
 
-// Not sure if this is correct or not too
-
 __device__ void mcts_expand(MCTSNode* node, int* board, int player, IGame* game) {
     int action_size = game->get_action_size(game);
     node->num_children = 0;
 
     for (int action = 0; action < action_size; action++) {
         if (game->is_valid_action(game, board, action)) {
-            MCTSNode* child = &node->children[node->num_children++];
-            child->action = action;
-            child->parent = node;
-            child->num_visits = 0;
-            child->Q = 0.0f;
-            child->P = 0.0f;
+            if (node->num_children < MAX_CHILDREN) {
+                MCTSNode* child = &node->children[node->num_children++];
+                child->action = action;
+                child->parent = node;
+                child->num_visits = 0;
+                child->Q = 0.0f;
+                child->P = 0.0f;
+                child->num_children = 0;
+            } else {
+                // Handle the case when we exceed MAX_CHILDREN
+                break;
+            }
         }
     }
 }
 
-// Not sure if this is accurate or not too
-
 __device__ MCTSNode* mcts_select_uct(MCTSNode* node) {
     MCTSNode* best_child = nullptr;
-    float best_uct = -1.0f;
+    float best_uct = -INFINITY;
+    float c_puct = 1.0f; // This value might need tuning
 
     for (int i = 0; i < node->num_children; i++) {
         MCTSNode* child = &node->children[i];
-        float uct = child->Q + child->P * sqrtf(node->num_visits) / (1 + child->num_visits);
+        float uct = child->Q + 
+                    c_puct * child->P * sqrtf(node->num_visits) / (1 + child->num_visits);
         if (uct > best_uct) {
             best_uct = uct;
             best_child = child;
@@ -549,15 +553,24 @@ __device__ MCTSNode* mcts_select_uct(MCTSNode* node) {
     return best_child;
 }
 
-/*
-    Not sure if this is correct, I would've thought to use like mcts_backpropagate from the thing
-*/
-
-__device__ void mcts_backpropagate(MCTSNode* node, float value) {
+ __device__ void mcts_backpropagate(MCTSNode* node, float value) {
     while (node != nullptr) {
-        node->num_visits++;
-        node->Q += (value - node->Q) / node->num_visits;
-        value = -value;  // Switch perspective for the other player
+        node->visit_count++;
+        node->value_sum += value;
+        
+        // Update Q value for the action that led to this node
+        if (node->parent != nullptr) {
+            for (int i = 0; i < node->parent->num_children; i++) {
+                if (node->parent->children[i] == node) {
+                    node->parent->N[i]++;
+                    node->parent->Q[i] = node->parent->Q[i] + 
+                        (value - node->parent->Q[i]) / node->parent->N[i];
+                    break;
+                }
+            }
+        }
+        
+        value = -value; // Switch perspective for the other player
         node = node->parent;
     }
 }
