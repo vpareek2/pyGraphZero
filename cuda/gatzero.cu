@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include "games/connect4/connect4.cuh"
+#include "games/tictactoe/tictactoe.cuh"
 #include "networks/gat/gat.cuh"
 #include "self_play/self_play.cuh"
 #include "utils/cuda_utils.cuh"
@@ -16,11 +17,17 @@ int main(int argc, char* argv[]) {
     }
 
     // Create game instance
-    Connect4Game* game = create_connect4_game();
+    TicTacToe* game = create_tictactoe_game();
     if (!game) {
-        fprintf(stderr, "Failed to create Connect4 game instance");
+        fprintf(stderr, "Failed to create TicTacToe game instance");
         return 1;
     }
+
+    // Connect4Game* game = create_connect4_game();
+    // if (!game) {
+    //     fprintf(stderr, "Failed to create Connect4 game instance");
+    //     return 1;
+    // }
 
     // Create neural network instance
     INeuralNet* nnet = create_gat_model((IGame*)game);
