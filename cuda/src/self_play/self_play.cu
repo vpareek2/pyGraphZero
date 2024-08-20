@@ -3,6 +3,7 @@
 #include <curand_kernel.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
@@ -358,6 +359,8 @@ __device__ void mcts_simulate(MCTSNode* node, int* board, int player, curandStat
         mcts_simulate(best_child, next_board, next_player, rng_state, game, nnet);
     }
 }
+
+// You'll need to implement the mcts_expand, mcts_select_uct, and mcts_backpropagate functions to complete the MCTS simulation. These functions will depend on your specific MCTS implementation and data structures.
 
 __device__ void mcts_get_policy(MCTSNode* node, float* policy, float temperature) {
     int action_size = node->num_children;
