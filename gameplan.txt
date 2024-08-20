@@ -2,6 +2,7 @@
 - arena
 - players
 - gatzero.cu
+- Logging stuff
 2. Implement chess
 3. Figure out a pipeline or a .sh file for easy start
 4. Figure out how to do easy parameter configs.
