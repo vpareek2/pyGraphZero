@@ -253,8 +253,47 @@ __host__ __device__ void chess_get_valid_moves(const IGame* self, const int* boa
     }
 }
 
-// Check if the game has ended (checkmate, stalemate, or draw) and return the result
-__host__ __device__ int chess_get_game_ended(const IGame* self, const int* board, int player);
+__host__ __device__ int chess_get_game_ended(const IGame* self, const int* board, int player) {
+    const ChessGame* chess_game = (const ChessGame*)self;
+    ChessBoard temp_board;
+
+    // Copy the input board to the temporary board
+    for (int i = 0; i < CHESS_BOARD_SIZE; i++) {
+        temp_board.pieces[i] = board[i];
+    }
+    temp_board.player = player;
+    temp_board.en_passant_target = chess_game->board.en_passant_target;
+    temp_board.halfmove_clock = chess_game->board.halfmove_clock;
+    temp_board.fullmove_number = chess_game->board.fullmove_number;
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 2; j++) {
+            temp_board.castling_rights[i][j] = chess_game->board.castling_rights[i][j];
+        }
+    }
+
+    // Check for checkmate
+    if (is_checkmate(&temp_board, player)) {
+        return -player; // Return the opposite of the current player (winner)
+    }
+
+    // Check for stalemate
+    if (is_stalemate(&temp_board, player)) {
+        return 1e-4; // Draw
+    }
+
+    // Check for insufficient material
+    if (is_insufficient_material(&temp_board)) {
+        return 1e-4; // Draw
+    }
+
+    // Check for fifty-move rule
+    if (is_fifty_move_rule(&temp_board)) {
+        return 1e-4; // Draw
+    }
+
+    // Game hasn't ended
+    return 0;
+}
 
 // Convert the board to a canonical form (e.g., always from white's perspective)
 __host__ __device__ void chess_get_canonical_form(const IGame* self, const int* board, int player, int* canonical_board);
@@ -298,3 +337,8 @@ __host__ __device__ bool is_threefold_repetition(const ChessBoard* board);
 
 // Check if the fifty-move rule applies
 __host__ __device__ bool is_fifty_move_rule(const ChessBoard* board);
+
+__host__ __device__ bool is_legal_move(const ChessBoard* board, int start, int end);
+__host__ __device__ void make_move(ChessBoard* board, int start, int end);
+__host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player);
+__host__ __device__ bool can_castle_queenside(const ChessBoard* board, int player);
