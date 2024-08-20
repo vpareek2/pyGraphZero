@@ -1,0 +1,12 @@
+1. Go through the files and make sure they are all correct
+- arena
+- players
+- gatzero.cu
+2. Implement chess
+3. Figure out a pipeline or a .sh file for easy start
+4. Figure out how to do easy parameter configs.
+5. Figure out GPU sharding for training across multiple GPUs
+6. Train on 8xA100s or maybe just 1 H100.
+7. Write an ArXiv paper
+8. Maybe get this published, if it works. 
+9. Maybe think about a Graph Transformer?
