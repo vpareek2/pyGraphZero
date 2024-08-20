@@ -52,7 +52,7 @@ typedef struct {
     float* d_pis;
     float* d_vs;
     MCTSNode* d_mcts_nodes;
-    TrainingExample* d_examples;  // New: device pointer for storing examples
+    TrainingExample* d_examples;
 } SelfPlayPipeline;
 
 // Function prototypes

@@ -144,6 +144,75 @@ void execute_self_play(SelfPlayPipeline* pipeline) {
     add_to_training_history(pipeline, h_examples.data(), totalExamples);
 }
 
+
+/*
+    Check and make sure that this is good
+*/
+void learn(SelfPlayPipeline* pipeline) {
+    // 1. Prepare training data
+    int total_examples = 0;
+    for (int i = 0; i < pipeline->historySize; i++) {
+        total_examples += pipeline->config.numEps * pipeline->config.numGames;
+    }
+
+    // Allocate GPU memory for training data
+    int* d_boards;
+    float* d_pis;
+    float* d_vs;
+    CUDA_CHECK(cudaMalloc(&d_boards, total_examples * MAX_BOARD_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pis, total_examples * MAX_BOARD_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_vs, total_examples * sizeof(float)));
+
+    // Copy training examples to GPU memory
+    int offset = 0;
+    for (int i = 0; i < pipeline->historySize; i++) {
+        int num_examples = pipeline->config.numEps * pipeline->config.numGames;
+        CUDA_CHECK(cudaMemcpy(d_boards + offset * MAX_BOARD_SIZE, 
+                              pipeline->trainExamplesHistory[i], 
+                              num_examples * MAX_BOARD_SIZE * sizeof(int), 
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_pis + offset * MAX_BOARD_SIZE, 
+                              pipeline->trainExamplesHistory[i] + MAX_BOARD_SIZE, 
+                              num_examples * MAX_BOARD_SIZE * sizeof(float), 
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_vs + offset, 
+                              pipeline->trainExamplesHistory[i] + 2 * MAX_BOARD_SIZE, 
+                              num_examples * sizeof(float), 
+                              cudaMemcpyHostToDevice));
+        offset += num_examples;
+    }
+
+    // 2. Train the neural network (assuming this function can work with GPU data)
+    pipeline->nnet->train(d_boards, d_pis, d_vs, total_examples);
+
+    // 3. Free GPU memory
+    CUDA_CHECK(cudaFree(d_boards));
+    CUDA_CHECK(cudaFree(d_pis));
+    CUDA_CHECK(cudaFree(d_vs));
+
+    // 4. Evaluate the new network against the previous one
+    if (pit_against_previous_version(pipeline) > pipeline->config.updateThreshold) {
+        // Update the previous best network
+        pipeline->pnet->load_checkpoint(pipeline->nnet->get_checkpoint_file());
+        
+        // Save the new best network
+        char filename[512];
+        get_checkpoint_file(pipeline, pipeline->config.numIters, filename);
+        pipeline->nnet->save_checkpoint(filename);
+    } else {
+        // Revert to the previous best network
+        pipeline->nnet->load_checkpoint(pipeline->pnet->get_checkpoint_file());
+    }
+
+    // 5. Remove oldest examples if history is too long
+    if (pipeline->historySize >= pipeline->config.numItersForTrainExamplesHistory) {
+        free(pipeline->trainExamplesHistory[0]);
+        memmove(pipeline->trainExamplesHistory, pipeline->trainExamplesHistory + 1, 
+                (pipeline->historySize - 1) * sizeof(TrainingExample*));
+        pipeline->historySize--;
+    }
+}
+
 __global__ void init_rng(curandState* states, unsigned long seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     curand_init(seed, idx, 0, &states[idx]);
