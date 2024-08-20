@@ -1,39 +1,52 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <cuda_runtime.h>
-
 #include "games/connect4/connect4.cuh"
 #include "games/tictactoe/tictactoe.cuh"
 #include "networks/gat/gat.cuh"
 #include "self_play/self_play.cuh"
 #include "utils/cuda_utils.cuh"
 
+#define CUDA_CHECK(call) { \
+    cudaError_t status = call; \
+    if (status != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); \
+        exit(1); \
+    } \
+}
+
 int main(int argc, char* argv[]) {
     // Initialize CUDA
-    cudaError_t cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed! Do you have a CUDA-capable GPU installed?");
-        return 1;
+    CUDA_CHECK(cudaSetDevice(0));
+
+    // Parse command-line arguments
+    const char* game_type = "tictactoe";
+    if (argc > 1) {
+        game_type = argv[1];
     }
 
     // Create game instance
-    TicTacToe* game = create_tictactoe_game();
-    if (!game) {
-        fprintf(stderr, "Failed to create TicTacToe game instance");
+    IGame* game = NULL;
+    if (strcmp(game_type, "tictactoe") == 0) {
+        game = (IGame*)create_tictactoe_game();
+    } else if (strcmp(game_type, "connect4") == 0) {
+        game = (IGame*)create_connect4_game();
+    } else {
+        fprintf(stderr, "Unsupported game type: %s\n", game_type);
         return 1;
     }
 
-    // Connect4Game* game = create_connect4_game();
-    // if (!game) {
-    //     fprintf(stderr, "Failed to create Connect4 game instance");
-    //     return 1;
-    // }
+    if (!game) {
+        fprintf(stderr, "Failed to create game instance\n");
+        return 1;
+    }
 
     // Create neural network instance
-    INeuralNet* nnet = create_gat_model((IGame*)game);
+    INeuralNet* nnet = create_gat_model(game);
     if (!nnet) {
-        fprintf(stderr, "Failed to create GAT neural network instance");
-        destroy_connect4_game(game);
+        fprintf(stderr, "Failed to create GAT neural network instance\n");
+        game->destroy(game);
         return 1;
     }
 
@@ -54,11 +67,11 @@ int main(int argc, char* argv[]) {
     };
 
     // Create self-play pipeline
-    SelfPlayPipeline* pipeline = create_self_play_pipeline((IGame*)game, nnet, config);
+    SelfPlayPipeline* pipeline = create_self_play_pipeline(game, nnet, config);
     if (!pipeline) {
-        fprintf(stderr, "Failed to create self-play pipeline");
+        fprintf(stderr, "Failed to create self-play pipeline\n");
         nnet->destroy(nnet);
-        destroy_connect4_game(game);
+        game->destroy(game);
         return 1;
     }
 
@@ -77,20 +90,18 @@ int main(int argc, char* argv[]) {
             char filename[256];
             snprintf(filename, sizeof(filename), "checkpoint_%04d.pth", i);
             nnet->save_checkpoint(nnet, config.checkpoint, filename);
+            printf("Saved checkpoint: %s\n", filename);
         }
     }
 
     // Clean up
     destroy_self_play_pipeline(pipeline);
     nnet->destroy(nnet);
-    destroy_connect4_game(game);
+    game->destroy(game);
 
     // Reset CUDA device
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
+    CUDA_CHECK(cudaDeviceReset());
 
+    printf("Training completed successfully\n");
     return 0;
 }
