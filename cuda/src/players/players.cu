@@ -1,4 +1,5 @@
 #include "players.cuh"
+
 #include <stdlib.h>
 #include <time.h>
 #include <cuda_runtime.h>
