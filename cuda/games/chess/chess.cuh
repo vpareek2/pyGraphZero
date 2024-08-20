@@ -1,12 +1,14 @@
-#ifndef CHESS_CUH
-#define CHESS_CUH
+#ifndef CHESS_H
+#define CHESS_H
 
-#include "../game.h"
+#include "../game.cuh"
+#include <cuda_runtime.h>
 
-#define CHESS_BOARD_SIZE 8
-#define CHESS_NUM_SQUARES (CHESS_BOARD_SIZE * CHESS_BOARD_SIZE)
+#define CHESS_BOARD_SIZE 64
+#define NUM_PIECE_TYPES 6
+#define NUM_PLAYERS 2
 
-// Piece representations
+// Piece representation
 #define EMPTY 0
 #define PAWN 1
 #define KNIGHT 2
@@ -20,10 +22,20 @@
 #define BLACK -1
 
 typedef struct {
+    int pieces[CHESS_BOARD_SIZE];
+    int player;
+    bool castling_rights[2][2];  // [player][kingside/queenside]
+    int en_passant_target;
+    int halfmove_clock;
+    int fullmove_number;
+} ChessBoard;
+
+typedef struct {
     IGame base;
-    // You can add chess-specific members here if needed
+    ChessBoard board;
 } ChessGame;
 
+// Function prototypes
 __host__ __device__ void chess_init(IGame* self);
 __host__ __device__ void chess_get_init_board(const IGame* self, int* board);
 __host__ __device__ void chess_get_board_size(const IGame* self, int* rows, int* cols);
@@ -39,13 +51,16 @@ void chess_get_symmetries(const IGame* self, const int* board, const float* pi, 
 void chess_string_representation(const IGame* self, const int* board, char* str, int str_size);
 void chess_display(const IGame* self, const int* board);
 
-// Create a Chess game instance
+// Helper functions (implement as needed)
+__host__ __device__ bool is_check(const ChessBoard* board, int player);
+__host__ __device__ bool is_checkmate(const ChessBoard* board, int player);
+__host__ __device__ bool is_stalemate(const ChessBoard* board, int player);
+__host__ __device__ bool is_insufficient_material(const ChessBoard* board);
+__host__ __device__ bool is_threefold_repetition(const ChessBoard* board);
+__host__ __device__ bool is_fifty_move_rule(const ChessBoard* board);
+
+// Create and destroy functions
 ChessGame* create_chess_game();
+void destroy_chess_game(ChessGame* game);
 
-// Helper functions (you may need to implement these)
-__host__ __device__ bool is_in_check(const int* board, int player);
-__host__ __device__ bool is_checkmate(const int* board, int player);
-__host__ __device__ bool is_stalemate(const int* board, int player);
-__host__ __device__ bool is_insufficient_material(const int* board);
-
-#endif // CHESS_CUH
+#endif // CHESS_H
