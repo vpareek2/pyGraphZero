@@ -396,14 +396,102 @@ void destroy_chess_game(ChessGame* game) {
  * HELPERS
  **************************************************/
 
-// Check if the given player is in check
-__host__ __device__ bool is_check(const ChessBoard* board, int player);
+/__host__ __device__ bool is_check(const ChessBoard* board, int player) {
+    U64 king_bb = 0, occ = 0, attacks = 0;
+    int king_square = -1;
 
-// Check if the given player is in checkmate
-__host__ __device__ bool is_checkmate(const ChessBoard* board, int player);
+    // Set up bitboards
+    for (int i = 0; i < CHESS_BOARD_SIZE; i++) {
+        if (board->pieces[i] != EMPTY) {
+            occ |= 1ULL << i;
+            if (board->pieces[i] == player * KING) {
+                king_bb = 1ULL << i;
+                king_square = i;
+            }
+        }
+    }
 
-// Check if the given player is in stalemate
-__host__ __device__ bool is_stalemate(const ChessBoard* board, int player);
+    if (king_square == -1) return false;  // No king found, shouldn't happen in a valid position
+
+    // Check for pawn attacks
+    attacks |= get_pawn_attacks(king_square, player);
+
+    // Check for knight attacks
+    attacks |= get_knight_attacks(king_square);
+
+    // Check for sliding piece attacks (bishop, rook, queen)
+    attacks |= get_sliding_attacks(BISHOP, king_square, occ);
+    attacks |= get_sliding_attacks(ROOK, king_square, occ);
+
+    // Check if any enemy piece is on an attacking square
+    while (attacks) {
+        int sq = LSB(attacks);
+        if (board->pieces[sq] * player < 0) {  // Enemy piece
+            int piece_type = abs(board->pieces[sq]);
+            if (piece_type == PAWN || piece_type == KNIGHT ||
+                (piece_type == BISHOP && (get_sliding_attacks(BISHOP, sq, occ) & king_bb)) ||
+                (piece_type == ROOK && (get_sliding_attacks(ROOK, sq, occ) & king_bb)) ||
+                (piece_type == QUEEN && ((get_sliding_attacks(BISHOP, sq, occ) | get_sliding_attacks(ROOK, sq, occ)) & king_bb))) {
+                return true;
+            }
+        }
+        POP_LSB(attacks);
+    }
+
+    return false;
+}
+
+__host__ __device__ bool is_checkmate(const ChessBoard* board, int player) {
+    if (!is_check(board, player)) return false;
+
+    // Try all possible moves for the player
+    for (int from = 0; from < CHESS_BOARD_SIZE; from++) {
+        if (board->pieces[from] * player <= 0) continue;  // Not player's piece
+
+        U64 moves = get_attacks(board->pieces[from], from, 0);  // Pseudo-legal moves
+        while (moves) {
+            int to = LSB(moves);
+            
+            // Make the move
+            ChessBoard new_board = *board;
+            new_board.pieces[to] = new_board.pieces[from];
+            new_board.pieces[from] = EMPTY;
+
+            // If this move gets out of check, it's not checkmate
+            if (!is_check(&new_board, player)) return false;
+
+            POP_LSB(moves);
+        }
+    }
+
+    return true;  // No legal moves found
+}
+
+__host__ __device__ bool is_stalemate(const ChessBoard* board, int player) {
+    if (is_check(board, player)) return false;
+
+    // Try all possible moves for the player
+    for (int from = 0; from < CHESS_BOARD_SIZE; from++) {
+        if (board->pieces[from] * player <= 0) continue;  // Not player's piece
+
+        U64 moves = get_attacks(board->pieces[from], from, 0);  // Pseudo-legal moves
+        while (moves) {
+            int to = LSB(moves);
+            
+            // Make the move
+            ChessBoard new_board = *board;
+            new_board.pieces[to] = new_board.pieces[from];
+            new_board.pieces[from] = EMPTY;
+
+            // If this move doesn't result in check, it's a legal move
+            if (!is_check(&new_board, player)) return false;
+
+            POP_LSB(moves);
+        }
+    }
+
+    return true;  // No legal moves found
+}
 
 // Check if there's insufficient material for checkmate
 __host__ __device__ bool is_insufficient_material(const ChessBoard* board);
