@@ -3,6 +3,8 @@
 #include <curand_kernel.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
 
 SelfPlayPipeline* create_self_play_pipeline(IGame* game, INeuralNet* nnet, SelfPlayConfig config) {
     SelfPlayPipeline* pipeline = (SelfPlayPipeline*)malloc(sizeof(SelfPlayPipeline));
@@ -66,34 +68,38 @@ void destroy_self_play_pipeline(SelfPlayPipeline* pipeline) {
     free(pipeline);
 }
 
+
 void execute_self_play(SelfPlayPipeline* pipeline) {
     int numGames = pipeline->config.numGames;
     int numMCTSSims = pipeline->config.numMCTSSims;
     int tempThreshold = pipeline->config.tempThreshold;
     
     // Initialize boards on GPU
-    int* init_board = (int*)malloc(MAX_BOARD_SIZE * sizeof(int));
-    if (!init_board) {
-        fprintf(stderr, "Failed to allocate memory for init_board\n");
-        return;
+    thrust::host_vector<int> h_init_board(MAX_BOARD_SIZE);
+    pipeline->game->get_init_board(pipeline->game, h_init_board.data());
+    thrust::device_vector<int> d_boards(numGames * MAX_BOARD_SIZE, 0);
+    for (int i = 0; i < numGames; ++i) {
+        thrust::copy(h_init_board.begin(), h_init_board.end(), d_boards.begin() + i * MAX_BOARD_SIZE);
     }
-    pipeline->game->get_init_board(pipeline->game, init_board);
-    CUDA_CHECK(cudaMemcpy(pipeline->d_boards, init_board, numGames * MAX_BOARD_SIZE * sizeof(int), cudaMemcpyHostToDevice));
-    free(init_board);
 
-    // Initialize game states, MCTS nodes, etc.
-    CUDA_CHECK(cudaMalloc(&pipeline->d_game_states, numGames * sizeof(GameState)));
-    CUDA_CHECK(cudaMalloc(&pipeline->d_mcts_roots, numGames * sizeof(MCTSNode)));
+    // Initialize MCTS nodes
+    thrust::device_vector<MCTSNode> d_mcts_roots(numGames);
+
+    // Initialize other necessary arrays
+    thrust::device_vector<float> d_pis(numGames * MAX_BOARD_SIZE);
+    thrust::device_vector<float> d_vs(numGames);
+    thrust::device_vector<int> d_players(numGames, 1);  // Start with player 1 for all games
 
     // Launch parallel self-play kernel
-    dim3 grid((numGames + 255) / 256);
-    dim3 block(256);
+    dim3 grid((numGames + 255) / 256, 1, 1);
+    dim3 block(256, 1, 1);
     
     parallel_self_play_kernel<<<grid, block>>>(
-        pipeline->d_mcts_roots,
-        pipeline->d_boards,
-        pipeline->d_pis,
-        pipeline->d_vs,
+        thrust::raw_pointer_cast(d_mcts_roots.data()),
+        thrust::raw_pointer_cast(d_boards.data()),
+        thrust::raw_pointer_cast(d_pis.data()),
+        thrust::raw_pointer_cast(d_vs.data()),
+        thrust::raw_pointer_cast(d_players.data()),
         pipeline->d_rng_states,
         pipeline->game,
         pipeline->nnet,
@@ -104,21 +110,15 @@ void execute_self_play(SelfPlayPipeline* pipeline) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Allocate host memory for results
-    TrainingExample* examples = (TrainingExample*)malloc(numGames * MAX_GAME_LENGTH * sizeof(TrainingExample));
-    if (!examples) {
-        fprintf(stderr, "Failed to allocate memory for examples\n");
-        return;
-    }
-
-    // Copy results back to CPU
-    CUDA_CHECK(cudaMemcpy(examples, pipeline->d_examples, numGames * MAX_GAME_LENGTH * sizeof(TrainingExample), cudaMemcpyDeviceToHost));
+    // Copy results back to CPU and process
+    thrust::host_vector<TrainingExample> h_examples(numGames * MAX_GAME_LENGTH);
+    CUDA_CHECK(cudaMemcpy(h_examples.data(), pipeline->d_examples, numGames * MAX_GAME_LENGTH * sizeof(TrainingExample), cudaMemcpyDeviceToHost));
 
     // Process and store examples
     int totalExamples = 0;
     for (int i = 0; i < numGames; i++) {
         for (int j = 0; j < MAX_GAME_LENGTH; j++) {
-            if (examples[i * MAX_GAME_LENGTH + j].board[0] == TERMINAL_STATE) {
+            if (h_examples[i * MAX_GAME_LENGTH + j].board[0] == TERMINAL_STATE) {
                 break;
             }
             totalExamples++;
@@ -126,12 +126,7 @@ void execute_self_play(SelfPlayPipeline* pipeline) {
     }
 
     // Add examples to the training history
-    add_to_training_history(pipeline, examples, totalExamples);
-
-    // Clean up
-    free(examples);
-    CUDA_CHECK(cudaFree(pipeline->d_game_states));
-    CUDA_CHECK(cudaFree(pipeline->d_mcts_roots));
+    add_to_training_history(pipeline, h_examples.data(), totalExamples);
 }
 
 __global__ void init_rng(curandState* states, unsigned long seed) {
@@ -139,37 +134,38 @@ __global__ void init_rng(curandState* states, unsigned long seed) {
     curand_init(seed, idx, 0, &states[idx]);
 }
 
-// In self_play.cu
-__global__ void self_play_kernel(IGame* game, GATModel* model, MCTSNode* roots, TrainingExample* examples, int num_games, int num_mcts_sims, float cpuct, curandState* rng_states) {
+__global__ void parallel_self_play_kernel(
+    MCTSNode* roots, int* boards, float* pis, float* vs, int* players,
+    curandState* rng_states, IGame* game, INeuralNet* nnet,
+    int num_games, int num_mcts_sims, int temp_threshold
+) {
     int game_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (game_idx >= num_games) return;
 
     curandState* rng_state = &rng_states[game_idx];
     MCTSNode* root = &roots[game_idx];
-    TrainingExample* game_examples = &examples[game_idx * MAX_GAME_LENGTH];
-    int example_count = 0;
-
-    int board[MAX_BOARD_SIZE];
-    game->get_init_board(game, board);
-    int player = 1;
+    int* board = &boards[game_idx * MAX_BOARD_SIZE];
+    float* pi = &pis[game_idx * MAX_BOARD_SIZE];
+    int player = players[game_idx];
+    int moves = 0;
 
     while (true) {
         // Perform MCTS simulations
         for (int i = 0; i < num_mcts_sims; i++) {
-            mcts_simulate(root, board, player, rng_state, game, model, cpuct);
+            mcts_simulate(root, board, player, rng_state, game, nnet);
         }
 
         // Compute policy from visit counts
-        float policy[MAX_BOARD_SIZE];
-        mcts_get_policy(root, policy, 1.0f); // Temperature 1.0 for exploration
+        float temp = (moves < temp_threshold) ? 1.0f : 1e-3f;
+        mcts_get_policy(root, pi, temp);
 
-        // Store the current state as a training example
-        memcpy(game_examples[example_count].board, board, sizeof(board));
-        memcpy(game_examples[example_count].pi, policy, sizeof(policy));
-        example_count++;
+        // Store the current state as a training example (assuming d_examples is accessible)
+        TrainingExample* example = &d_examples[game_idx * MAX_GAME_LENGTH + moves];
+        memcpy(example->board, board, MAX_BOARD_SIZE * sizeof(int));
+        memcpy(example->pi, pi, MAX_BOARD_SIZE * sizeof(float));
 
         // Select action
-        int action = select_action(policy, game->get_action_size(game), rng_state);
+        int action = select_action(pi, game->get_action_size(game), rng_state);
 
         // Apply action
         int next_board[MAX_BOARD_SIZE];
@@ -180,17 +176,30 @@ __global__ void self_play_kernel(IGame* game, GATModel* model, MCTSNode* roots, 
         float reward = game->get_game_ended_cuda(game, next_board, next_player);
         if (reward != 0) {
             // Game has ended, update all examples with the reward
-            for (int i = 0; i < example_count; i++) {
-                game_examples[i].v = reward * (i % 2 == 0 ? 1 : -1);
+            for (int i = 0; i <= moves; i++) {
+                TrainingExample* ex = &d_examples[game_idx * MAX_GAME_LENGTH + i];
+                ex->v = reward * (i % 2 == 0 ? 1 : -1);
             }
+            vs[game_idx] = reward;
             break;
         }
 
         // Move to next state
-        memcpy(board, next_board, sizeof(board));
+        memcpy(board, next_board, MAX_BOARD_SIZE * sizeof(int));
         player = next_player;
         root = mcts_move_to_child(root, action);
-    }
-}
+        moves++;
 
-// Implement other helper functions as needed
+        if (moves >= MAX_GAME_LENGTH - 1) {
+            // Force end of game if it's taking too long
+            for (int i = 0; i <= moves; i++) {
+                TrainingExample* ex = &d_examples[game_idx * MAX_GAME_LENGTH + i];
+                ex->v = 0.0f;  // Draw
+            }
+            vs[game_idx] = 0.0f;
+            break;
+        }
+    }
+
+    players[game_idx] = player;  // Update final player state
+}
