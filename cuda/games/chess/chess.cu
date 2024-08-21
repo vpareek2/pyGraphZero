@@ -1,6 +1,4 @@
 // This is so messy tbh need to fix
-
-
 #include "chess.cuh"
 
 // Zobrist random number tables
@@ -775,14 +773,88 @@ __host__ __device__ bool is_legal_move(const ChessBoard* board, int start, int e
 
 
 __host__ __device__ void make_move(ChessBoard* board, int start, int end) {
-    // ... existing move logic ...
+    int moving_piece = board->pieces[start];
+    int captured_piece = board->pieces[end];
+    int player = board->player;
+
+    // Basic move
+    board->pieces[end] = moving_piece;
+    board->pieces[start] = EMPTY;
+
+    // Handle special moves
+    int piece_type = abs(moving_piece);
+    int start_rank = start / 8;
+    int start_file = start % 8;
+    int end_rank = end / 8;
+    int end_file = end % 8;
+
+    // Pawn promotion
+    if (piece_type == PAWN && (end_rank == 0 || end_rank == 7)) {
+        // Assuming promotion to Queen by default
+        board->pieces[end] = QUEEN * player;
+    }
+
+    // En passant capture
+    if (piece_type == PAWN && end == board->en_passant_target) {
+        int captured_pawn_pos = end + (player == WHITE ? -8 : 8);
+        board->pieces[captured_pawn_pos] = EMPTY;
+    }
+
+    // Update en passant target
+    if (piece_type == PAWN && abs(end_rank - start_rank) == 2) {
+        board->en_passant_target = (start + end) / 2;
+    } else {
+        board->en_passant_target = -1;
+    }
+
+    // Castling
+    if (piece_type == KING && abs(end_file - start_file) == 2) {
+        int rook_start, rook_end;
+        if (end_file > start_file) { // Kingside castling
+            rook_start = start + 3;
+            rook_end = start + 1;
+        } else { // Queenside castling
+            rook_start = start - 4;
+            rook_end = start - 1;
+        }
+        board->pieces[rook_end] = board->pieces[rook_start];
+        board->pieces[rook_start] = EMPTY;
+    }
+
+    // Update castling rights
+    if (piece_type == KING) {
+        board->castling_rights[player == WHITE ? 0 : 1][0] = false;
+        board->castling_rights[player == WHITE ? 0 : 1][1] = false;
+    } else if (piece_type == ROOK) {
+        if (start == 0 || start == 56) // Queenside rook
+            board->castling_rights[player == WHITE ? 0 : 1][1] = false;
+        else if (start == 7 || start == 63) // Kingside rook
+            board->castling_rights[player == WHITE ? 0 : 1][0] = false;
+    }
+
+    // Update halfmove clock
+    if (piece_type == PAWN || captured_piece != EMPTY)
+        board->halfmove_clock = 0;
+    else
+        board->halfmove_clock++;
+
+    // Update fullmove number
+    if (player == BLACK)
+        board->fullmove_number++;
+
+    // Switch player
+    board->player = -player;
 
     // Update position history
     unsigned long long new_hash = compute_zobrist_hash(board);
     int index = board->history_count % MAX_HISTORY;
     board->position_history[index] = new_hash;
     board->history_count++;
-}__host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player);
+}
+}
+
+
+__host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player);
 __host__ __device__ bool can_castle_queenside(const ChessBoard* board, int player);
 
 __host__ __device__ U64 get_attacks(int piece, int square, U64 occupancy);
@@ -790,3 +862,8 @@ __host__ __device__ U64 get_king_attacks(int square);
 __host__ __device__ U64 get_pawn_attacks(int square, int color);
 __host__ __device__ U64 get_knight_attacks(int square);
 __host__ __device__ U64 get_sliding_attacks(int piece, int square, U64 occupancy);
+
+__host__ __device__ bool is_square_attacked(const ChessBoard* board, int square, int attacker) {
+    // Implementation to check if a square is under attack by the specified player
+    // This is used for castling checks
+}
