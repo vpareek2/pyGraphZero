@@ -7,6 +7,7 @@
 #include "networks/gat/gat.cuh"
 #include "self_play/self_play.cuh"
 #include "utils/cuda_utils.cuh"
+#include "config.h"  // Include the new configuration header
 
 #define CUDA_CHECK(call) { \
     cudaError_t status = call; \
@@ -17,6 +18,13 @@
 }
 
 int main(int argc, char* argv[]) {
+    // Load configuration
+    GlobalConfig* config = load_config("config.json");
+    if (!config) {
+        fprintf(stderr, "Failed to load configuration\n");
+        return 1;
+    }
+
     // Initialize CUDA
     CUDA_CHECK(cudaSetDevice(0));
 
@@ -34,11 +42,13 @@ int main(int argc, char* argv[]) {
         game = (IGame*)create_connect4_game();
     } else {
         fprintf(stderr, "Unsupported game type: %s\n", game_type);
+        free_config(config);
         return 1;
     }
 
     if (!game) {
         fprintf(stderr, "Failed to create game instance\n");
+        free_config(config);
         return 1;
     }
 
@@ -47,36 +57,25 @@ int main(int argc, char* argv[]) {
     if (!nnet) {
         fprintf(stderr, "Failed to create GAT neural network instance\n");
         game->destroy(game);
+        free_config(config);
         return 1;
     }
 
-    // Initialize self-play configuration
-    SelfPlayConfig config = {
-        .numIters = 1000,
-        .numEps = 100,
-        .numGames = 100,
-        .tempThreshold = 15,
-        .updateThreshold = 0.6f,
-        .maxlenOfQueue = 200000,
-        .numMCTSSims = 25,
-        .arenaCompare = 40,
-        .cpuct = 1.0f,
-        .checkpoint = "./checkpoints",
-        .load_model = false,
-        .numItersForTrainExamplesHistory = 20
-    };
+    // Use the configuration for self-play
+    SelfPlayConfig sp_config = config->self_play.config;
 
     // Create self-play pipeline
-    SelfPlayPipeline* pipeline = create_self_play_pipeline(game, nnet, config);
+    SelfPlayPipeline* pipeline = create_self_play_pipeline(game, nnet, sp_config);
     if (!pipeline) {
         fprintf(stderr, "Failed to create self-play pipeline\n");
         nnet->destroy(nnet);
         game->destroy(game);
+        free_config(config);
         return 1;
     }
 
     // Main training loop
-    for (int i = 1; i <= config.numIters; i++) {
+    for (int i = 1; i <= sp_config.numIters; i++) {
         printf("Starting iteration %d\n", i);
 
         // Execute self-play
@@ -87,9 +86,9 @@ int main(int argc, char* argv[]) {
 
         // Optionally save checkpoint
         if (i % 10 == 0) {
-            char filename[256];
+            char filename[config->neural_network.max_filename_length];
             snprintf(filename, sizeof(filename), "checkpoint_%04d.pth", i);
-            nnet->save_checkpoint(nnet, config.checkpoint, filename);
+            nnet->save_checkpoint(nnet, sp_config.checkpoint, filename);
             printf("Saved checkpoint: %s\n", filename);
         }
     }
@@ -98,6 +97,7 @@ int main(int argc, char* argv[]) {
     destroy_self_play_pipeline(pipeline);
     nnet->destroy(nnet);
     game->destroy(game);
+    free_config(config);
 
     // Reset CUDA device
     CUDA_CHECK(cudaDeviceReset());
