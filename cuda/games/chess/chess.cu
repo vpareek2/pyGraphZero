@@ -1,4 +1,13 @@
+// This is so messy tbh need to fix
+
+
 #include "chess.cuh"
+
+// Zobrist random number tables
+__device__ __constant__ unsigned long long ZOBRIST_PIECES[ZOBRIST_PIECE_TYPES][ZOBRIST_SQUARES];
+__device__ __constant__ unsigned long long ZOBRIST_CASTLING[16];
+__device__ __constant__ unsigned long long ZOBRIST_EN_PASSANT[8];
+__device__ __constant__ unsigned long long ZOBRIST_SIDE_TO_MOVE;
 
 // Initialize the chess game state
 __host__ __device__ void chess_init(IGame* self) {
@@ -40,6 +49,16 @@ __host__ __device__ void chess_init(IGame* self) {
     board->en_passant_target = -1;
     board->halfmove_clock = 0;
     board->fullmove_number = 1;
+    
+    board->history_count = 0;
+    for (int i = 0; i < MAX_HISTORY; i++) {
+        board->position_history[i] = 0ULL;
+    }
+
+    // Compute and store the initial position hash
+    board->position_history[0] = compute_zobrist_hash(board);
+    board->history_count = 1;
+
 }
 
 // Set up the initial chess board configuration
@@ -242,12 +261,21 @@ __host__ __device__ void chess_get_valid_moves(const IGame* self, const int* boa
 
         // Handle castling
         if (abs(piece) == KING) {
-            int rank = start / 8;
             if (can_castle_kingside(&temp_board, player)) {
-                valid_moves[start * 73 + (start + 2)] = true;
+                int kingside_end = start + 2;
+                if (!is_check(&temp_board, player) && 
+                    !is_square_attacked(&temp_board, start + 1, -player) &&
+                    !is_square_attacked(&temp_board, kingside_end, -player)) {
+                    valid_moves[start * 73 + kingside_end] = true;
+                }
             }
             if (can_castle_queenside(&temp_board, player)) {
-                valid_moves[start * 73 + (start - 2)] = true;
+                int queenside_end = start - 2;
+                if (!is_check(&temp_board, player) && 
+                    !is_square_attacked(&temp_board, start - 1, -player) &&
+                    !is_square_attacked(&temp_board, queenside_end, -player)) {
+                    valid_moves[start * 73 + queenside_end] = true;
+                }
             }
         }
     }
@@ -493,18 +521,268 @@ __host__ __device__ bool is_stalemate(const ChessBoard* board, int player) {
     return true;  // No legal moves found
 }
 
-// Check if there's insufficient material for checkmate
-__host__ __device__ bool is_insufficient_material(const ChessBoard* board);
+__host__ __device__ bool is_insufficient_material(const ChessBoard* board) {
+    int white_knights = 0, white_bishops = 0, white_bishop_color = -1;
+    int black_knights = 0, black_bishops = 0, black_bishop_color = -1;
+    int total_pieces = 0;
 
-// Check for threefold repetition (may need additional state tracking)
-__host__ __device__ bool is_threefold_repetition(const ChessBoard* board);
+    for (int i = 0; i < CHESS_BOARD_SIZE; i++) {
+        int piece = board->pieces[i];
+        if (piece != EMPTY) {
+            total_pieces++;
+            switch (abs(piece)) {
+                case PAWN:
+                case ROOK:
+                case QUEEN:
+                    return false;  // Sufficient material
+                case KNIGHT:
+                    if (piece > 0) white_knights++;
+                    else black_knights++;
+                    break;
+                case BISHOP:
+                    if (piece > 0) {
+                        white_bishops++;
+                        white_bishop_color = (white_bishop_color == -1) ? (i % 2) : white_bishop_color;
+                    } else {
+                        black_bishops++;
+                        black_bishop_color = (black_bishop_color == -1) ? (i % 2) : black_bishop_color;
+                    }
+                    break;
+            }
+        }
+    }
+
+    // King vs. King
+    if (total_pieces == 2) return true;
+
+    // King and Bishop vs. King or King and Knight vs. King
+    if (total_pieces == 3 && (white_bishops == 1 || black_bishops == 1 || white_knights == 1 || black_knights == 1)) return true;
+
+    // King and two Knights vs. King
+    if (total_pieces == 4 && ((white_knights == 2 && black_bishops == 0 && black_knights == 0) || 
+                              (black_knights == 2 && white_bishops == 0 && white_knights == 0))) return true;
+
+    // Both sides have a single bishop, and they are on the same color
+    if (white_bishops == 1 && black_bishops == 1 && white_bishop_color == black_bishop_color && 
+        white_knights == 0 && black_knights == 0) return true;
+
+    return false;
+}
+
+__host__ __device__ bool is_threefold_repetition(const ChessBoard* board) {
+    if (board->history_count < 4) return false;  // Need at least 4 moves for a threefold repetition
+
+    unsigned long long current_hash = compute_zobrist_hash(board);
+    int repetition_count = 1;  // Current position counts as 1
+
+    for (int i = board->history_count - 1; i >= 0; i--) {
+        if (board->position_history[i] == current_hash) {
+            repetition_count++;
+            if (repetition_count >= 3) return true;
+        }
+    }
+
+    return false;
+}
+
+// Initialize Zobrist tables (call this function once at the start of your program)
+void initialize_zobrist() {
+    unsigned long long host_pieces[ZOBRIST_PIECE_TYPES][ZOBRIST_SQUARES];
+    unsigned long long host_castling[16];
+    unsigned long long host_en_passant[8];
+    unsigned long long host_side_to_move;
+
+    // Initialize random number generator
+    curandState_t state;
+    curand_init(1234, 0, 0, &state);
+
+    // Generate random numbers for pieces
+    for (int i = 0; i < ZOBRIST_PIECE_TYPES; i++) {
+        for (int j = 0; j < ZOBRIST_SQUARES; j++) {
+            host_pieces[i][j] = curand(&state);
+        }
+    }
+
+    // Generate random numbers for castling rights
+    for (int i = 0; i < 16; i++) {
+        host_castling[i] = curand(&state);
+    }
+
+    // Generate random numbers for en passant files
+    for (int i = 0; i < 8; i++) {
+        host_en_passant[i] = curand(&state);
+    }
+
+    // Generate random number for side to move
+    host_side_to_move = curand(&state);
+
+    // Copy to device constant memory
+    cudaMemcpyToSymbol(ZOBRIST_PIECES, host_pieces, sizeof(host_pieces));
+    cudaMemcpyToSymbol(ZOBRIST_CASTLING, host_castling, sizeof(host_castling));
+    cudaMemcpyToSymbol(ZOBRIST_EN_PASSANT, host_en_passant, sizeof(host_en_passant));
+    cudaMemcpyToSymbol(ZOBRIST_SIDE_TO_MOVE, &host_side_to_move, sizeof(host_side_to_move));
+}
+
+// Zobrist hash computation function
+__device__ __host__ unsigned long long compute_zobrist_hash(const ChessBoard* board) {
+    unsigned long long hash = 0;
+
+    // Hash pieces
+    for (int sq = 0; sq < 64; sq++) {
+        int piece = board->pieces[sq];
+        if (piece != EMPTY) {
+            int piece_index = (abs(piece) - 1) * 2 + (piece > 0 ? 0 : 1);
+            hash ^= ZOBRIST_PIECES[piece_index][sq];
+        }
+    }
+
+    // Hash castling rights
+    int castling_index = (board->castling_rights[WHITE][0] << 3) |
+                         (board->castling_rights[WHITE][1] << 2) |
+                         (board->castling_rights[BLACK][0] << 1) |
+                         (board->castling_rights[BLACK][1]);
+    hash ^= ZOBRIST_CASTLING[castling_index];
+
+    // Hash en passant
+    if (board->en_passant_target != -1) {
+        int file = board->en_passant_target % 8;
+        hash ^= ZOBRIST_EN_PASSANT[file];
+    }
+
+    // Hash side to move
+    if (board->player == BLACK) {
+        hash ^= ZOBRIST_SIDE_TO_MOVE;
+    }
+
+    return hash;
+}
 
 // Check if the fifty-move rule applies
-__host__ __device__ bool is_fifty_move_rule(const ChessBoard* board);
+__host__ __device__ bool is_fifty_move_rule(const ChessBoard* board) {
+    // The fifty-move rule states that a player can claim a draw 
+    // if no capture has been made and no pawn has been moved in 
+    // the last fifty moves (by both players).
+    
+    // In chess, the halfmove clock keeps track of the number of 
+    // halfmoves (or plies) since the last pawn move or capture.
+    // It's reset to 0 after a capture or a pawn move.
+    
+    // The fifty-move rule is invoked when the halfmove clock 
+    // reaches 100 (50 full moves, which is 100 halfmoves).
+    
+    return board->halfmove_clock >= 100;
+}
+__host__ __device__ bool is_legal_move(const ChessBoard* board, int start, int end) {
+    int piece = board->pieces[start];
+    int player = board->player;
+    
+    // Check if the piece belongs to the current player
+    if (piece * player <= 0) return false;
+    
+    // Check if the destination square is occupied by a friendly piece
+    if (board->pieces[end] * player > 0) return false;
+    
+    int piece_type = abs(piece);
+    int start_rank = start / 8;
+    int start_file = start % 8;
+    int end_rank = end / 8;
+    int end_file = end % 8;
+    
+    // Check piece-specific movement rules
+    switch (piece_type) {
+        case PAWN:
+            // Pawn move
+            if (player == WHITE) {
+                if (start_rank == 1 && end_rank == 3 && start_file == end_file && board->pieces[start + 8] == EMPTY)
+                    return true; // Double step from initial position
+                if (end_rank == start_rank + 1) {
+                    if (start_file == end_file && board->pieces[end] == EMPTY)
+                        return true; // Single step forward
+                    if (abs(end_file - start_file) == 1 && (board->pieces[end] < 0 || end == board->en_passant_target))
+                        return true; // Capture or en passant
+                }
+            } else { // BLACK
+                if (start_rank == 6 && end_rank == 4 && start_file == end_file && board->pieces[start - 8] == EMPTY)
+                    return true; // Double step from initial position
+                if (end_rank == start_rank - 1) {
+                    if (start_file == end_file && board->pieces[end] == EMPTY)
+                        return true; // Single step forward
+                    if (abs(end_file - start_file) == 1 && (board->pieces[end] > 0 || end == board->en_passant_target))
+                        return true; // Capture or en passant
+                }
+            }
+            break;
+        
+        case KNIGHT:
+            if ((abs(end_rank - start_rank) == 2 && abs(end_file - start_file) == 1) ||
+                (abs(end_rank - start_rank) == 1 && abs(end_file - start_file) == 2))
+                return true;
+            break;
+        
+        case BISHOP:
+            if (abs(end_rank - start_rank) == abs(end_file - start_file)) {
+                int rank_step = (end_rank > start_rank) ? 1 : -1;
+                int file_step = (end_file > start_file) ? 1 : -1;
+                for (int r = start_rank + rank_step, f = start_file + file_step; 
+                     r != end_rank; r += rank_step, f += file_step) {
+                    if (board->pieces[r * 8 + f] != EMPTY)
+                        return false; // Path is blocked
+                }
+                return true;
+            }
+            break;
+        
+        case ROOK:
+            if (start_rank == end_rank || start_file == end_file) {
+                int step = (start_rank == end_rank) ? 
+                           ((end_file > start_file) ? 1 : -1) : 
+                           ((end_rank > start_rank) ? 8 : -8);
+                for (int sq = start + step; sq != end; sq += step) {
+                    if (board->pieces[sq] != EMPTY)
+                        return false; // Path is blocked
+                }
+                return true;
+            }
+            break;
+        
+        case QUEEN:
+            if (start_rank == end_rank || start_file == end_file || 
+                abs(end_rank - start_rank) == abs(end_file - start_file)) {
+                int rank_step = (end_rank == start_rank) ? 0 : ((end_rank > start_rank) ? 1 : -1);
+                int file_step = (end_file == start_file) ? 0 : ((end_file > start_file) ? 1 : -1);
+                for (int r = start_rank + rank_step, f = start_file + file_step; 
+                     r != end_rank || f != end_file; r += rank_step, f += file_step) {
+                    if (board->pieces[r * 8 + f] != EMPTY)
+                        return false; // Path is blocked
+                }
+                return true;
+            }
+            break;
+        
+        case KING:
+            if (abs(end_rank - start_rank) <= 1 && abs(end_file - start_file) <= 1)
+                return true;
+            // Check castling
+            if (start_rank == end_rank && abs(end_file - start_file) == 2) {
+                bool kingside = (end_file > start_file);
+                return (kingside ? can_castle_kingside(board, player) : can_castle_queenside(board, player));
+            }
+            break;
+    }
+    
+    return false;
+}
 
-__host__ __device__ bool is_legal_move(const ChessBoard* board, int start, int end);
-__host__ __device__ void make_move(ChessBoard* board, int start, int end);
-__host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player);
+
+__host__ __device__ void make_move(ChessBoard* board, int start, int end) {
+    // ... existing move logic ...
+
+    // Update position history
+    unsigned long long new_hash = compute_zobrist_hash(board);
+    int index = board->history_count % MAX_HISTORY;
+    board->position_history[index] = new_hash;
+    board->history_count++;
+}__host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player);
 __host__ __device__ bool can_castle_queenside(const ChessBoard* board, int player);
 
 __host__ __device__ U64 get_attacks(int piece, int square, U64 occupancy);

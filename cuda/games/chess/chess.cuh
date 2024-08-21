@@ -25,6 +25,10 @@
 #define LSB(x) (__builtin_ffsll(x) - 1)
 #define POP_LSB(x) (x &= (x - 1))
 
+// Zobrist hashing constants
+#define ZOBRIST_PIECE_TYPES 12  // 6 piece types * 2 colors
+#define ZOBRIST_SQUARES 64
+
 typedef struct {
     int pieces[CHESS_BOARD_SIZE];
     int player;
@@ -32,6 +36,8 @@ typedef struct {
     int en_passant_target;
     int halfmove_clock;
     int fullmove_number;
+    unsigned long long position_history[MAX_HISTORY];
+    int history_count;
 } ChessBoard;
 
 typedef struct {
@@ -74,6 +80,15 @@ __host__ __device__ U64 get_king_attacks(int square);
 __host__ __device__ U64 get_pawn_attacks(int square, int color);
 __host__ __device__ U64 get_knight_attacks(int square);
 __host__ __device__ U64 get_sliding_attacks(int piece, int square, U64 occupancy);
+
+// Zobrist hashing function declaration
+__device__ __host__ unsigned long long compute_zobrist_hash(const ChessBoard* board);
+
+// Zobrist random number table declarations
+extern __device__ __constant__ unsigned long long ZOBRIST_PIECES[ZOBRIST_PIECE_TYPES][ZOBRIST_SQUARES];
+extern __device__ __constant__ unsigned long long ZOBRIST_CASTLING[16];
+extern __device__ __constant__ unsigned long long ZOBRIST_EN_PASSANT[8];
+extern __device__ __constant__ unsigned long long ZOBRIST_SIDE_TO_MOVE;
 
 // Create and destroy functions
 ChessGame* create_chess_game();
