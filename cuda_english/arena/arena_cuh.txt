@@ -1,0 +1,74 @@
+
+
+
+
+
+If the file arena.cuh is not defined (used to ensure each file is included once only)
+define arena.cuh
+
+
+include all of the different components from player.cuh (cuda header file for player)
+include all of the different components from game.cuh (cuda header file for game)
+
+
+Define a macro MAX_BOARD_SIZE to be 64 (this means wherever you write MAX_BOARD_SIZE, 64 will be used at compilation)
+
+
+
+
+
+create a customized data structure named arena which will contain:
+    a pointer to a player(defined in player.cuh) named player1
+    a pointer to a player named player2
+    a pointer to the game interface named game, which will have all the game components
+thats all the components, name it Arena
+
+
+
+
+
+
+
+
+create a function named create_arena which will create a new arena, output a pointer to an Arena object and has:
+    input player1 from earlier
+    input player2 from earlier
+    input game from earlier
+end of function declaration
+
+
+
+
+
+
+
+create a function named play_game which will play a single game in the arena, it outputs an integer and:
+    inputs a pointer to Arena, the same arena returned from create_arena
+    a variable named verbose which is either true or false, to enable or disable verbose output
+end of function declaration
+
+
+
+
+
+
+
+
+
+create a function that plays multiple games in the arena, most likely by calling play_game, which returns nothing and:
+    inputs the arena from earlier
+    inputs an integer with the number of games to be played
+    inputs a pointer to wins
+    inputs a pointer to losses
+    inputs a pointer to draws
+end of function declaration
+
+
+
+
+
+This function destroys an arena instance, by freeing it from memory, and returns nothing
+    it only takes in the same arena from earlier
+end of function declaration
+
+close the preceding conditional compilation
