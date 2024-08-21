@@ -1,0 +1,267 @@
+arena.cuh:
+#define MAX_BOARD_SIZE         64  // Assuming the maximum board size is for 8x8 chess
+
+tictactoe.cuh:
+define TICTACTOE_BOARD_SIZE 3
+define TICTACTOE_NUM_SQUARES (TICTACTOE_BOARD_SIZE * TICTACTOE_BOARD_SIZE)
+
+game.cuh:
+#define MAX_BOARD_SIZE 64  // Suitable for games up to 8x8 (planning chess scale up)
+#define MAX_SYMMETRIES 8   // Change later
+
+mcts.cuh:
+// Define constants
+#define MAX_BOARD_SIZE     64
+#define MAX_CHILDREN       218
+#define C_PUCT             1.0
+#define NUM_SIMULATIONS    1600
+#define THREADS_PER_BLOCK  256
+#define MAX_BATCH_SIZE     64  // Constant for batch processing
+
+typedef struct MCTSNode {
+  int             board[MAX_BOARD_SIZE];
+  MCTSNode*       children[MAX_CHILDREN];
+  int             num_children;
+  float           P[MAX_CHILDREN];
+  float           Q[MAX_CHILDREN];
+  int             N[MAX_CHILDREN];
+  int             visit_count;
+  float           value_sum;
+  int             player;
+  int             action;
+} MCTSNode;
+
+neural_network.h
+
+gat.cuh:
+// Model configuration
+typedef struct {
+  int input_features;
+  int hidden_features;
+  int output_features;
+  int num_heads;
+  int num_layers;
+  int num_actions;
+  int max_nodes;
+  int max_edges;
+  float learning_rate;
+  float weight_decay;
+  float dropout;
+  float alpha;  // LeakyReLU angle
+  int batch_size;
+  int epochs;
+} ModelConfig;
+
+// GAT model
+typedef struct {
+  // Input block
+  cudnnTensorDescriptor_t input_descriptor;
+  float *input_weights, *input_bias;
+
+  // GAT layers
+  cudnnTensorDescriptor_t *layer_descriptors;
+  float **layer_weights, **layer_biases;
+  float **attention_weights;
+
+  // Output block
+  cudnnTensorDescriptor_t value_descriptor, policy_descriptor;
+  float *value_weights, *value_bias;
+  float *policy_weights, *policy_bias;
+
+  // Running mean and variance for batch normalization (if used)
+  float *input_bn_mean, *input_bn_var;
+  float **layer_bn_means, **layer_bn_vars;
+  float *value_bn_mean, *value_bn_var, *policy_bn_mean, *policy_bn_var;
+
+  // Saved mean and variance for batch normalization (if used)
+  float *input_bn_save_mean, *input_bn_save_var;
+  float **layer_bn_save_means, **layer_bn_save_vars;
+  float *value_bn_save_mean, *value_bn_save_var, *policy_bn_save_mean, *policy_bn_save_var;
+
+  // CUDNN handles
+  cudnnHandle_t cudnn_handle;
+
+  // Model configuration
+  ModelConfig config;
+
+  // PyTorch optimizer
+  torch::optim::Adam* optimizer;
+
+  // Gradient fields
+  float *d_input_weights;
+  float **d_layer_weights, **d_attention_weights;
+  float *d_value_weights, *d_policy_weights;
+
+  // Workspace for cuDNN
+  void *workspace;
+  size_t workspace_size;
+
+  // Learning rate and weight decay
+  float learning_rate;
+  float weight_decay;
+} GATModel;
+
+typedef struct {
+  INeuralNet base;
+  GATModel model;
+} GATWrapper;
+
+resnet.cuh:
+// Model configuration
+typedef struct {
+  int input_channels;
+  int input_height;
+  int input_width;
+  int num_filters;
+  int num_residual_blocks;
+  int num_actions;
+  float learning_rate;
+  float weight_decay;
+  int batch_size;
+  int epochs;
+} ModelConfig;
+
+// ResNet model
+typedef struct {
+  // Input block
+  cudnnFilterDescriptor_t input_conv_filter;
+  float *input_conv_weights, *input_bn_scale, *input_bn_bias;
+
+  // Residual blocks
+  cudnnFilterDescriptor_t *res_conv_filters;
+  float **res_conv_weights, **res_bn_scales, **res_bn_biases;
+  float **res_bn_means, **res_bn_vars;
+
+  // Output block
+  cudnnFilterDescriptor_t value_conv_filter, policy_conv_filter;
+  float *value_conv_weights, *value_bn_scale, *value_bn_bias;
+  float *value_fc1_weights, *value_fc1_bias;
+  float *value_fc2_weights, *value_fc2_bias;
+  float *policy_conv_weights, *policy_bn_scale, *policy_bn_bias;
+  float *policy_fc_weights, *policy_fc_bias;
+
+  // CUDNN handle
+  cudnnHandle_t cudnn_handle;
+
+  // Model configuration
+  ModelConfig config;
+
+  // Workspace for cuDNN
+  void *workspace;
+  size_t workspace_size;
+
+  // Gradient fields
+  float *d_input_conv_weights;
+  float **d_res_conv_weights;
+  float *d_value_conv_weights, *d_policy_conv_weights;
+
+  // Additional fields
+  float *value_bn_mean, *value_bn_var;
+  float *policy_bn_mean, *policy_bn_var;
+} ResNetModel;
+
+players.cuh:
+/**
+ * @struct IPlayer
+ * @brief Interface for a player
+ */
+ typedef struct {
+  int (*get_action)(const IGame* game, const int* board, int player);
+} IPlayer;
+
+/**
+* @struct RandomPlayer
+* @brief Implements a random player
+*/
+typedef struct {
+  IPlayer base;
+} RandomPlayer;
+
+/**
+* @struct MCTSPlayer
+* @brief Implements a Monte Carlo Tree Search player
+*/
+typedef struct {
+  IPlayer base;
+  MCTSState* mcts_state;
+  float temperature;
+} MCTSPlayer;
+
+/**
+* @struct NNetPlayer
+* @brief Implements a Neural Network player
+*/
+typedef struct {
+  IPlayer base;
+  INeuralNet* net;
+  MCTSState* mcts_state;
+  float temperature;
+} NNetPlayer;
+
+self_play.cuh:
+// Define constants
+#define MAX_BATCH_SIZE             1024
+#define MAX_NUM_GAMES              10000
+#define MAX_GAME_LENGTH            1000
+#define TERMINAL_STATE             -1
+#define MAX_FILENAME_LENGTH        256
+
+// CUDA error checking macro
+#define CUDA_CHECK(call) { \
+    cudaError_t status = call; \
+    if (status != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); \
+        exit(1); \
+    } \
+}
+
+/**
+ * @struct SelfPlayConfig
+ * @brief Configuration for self-play
+ */
+typedef struct SelfPlayConfig {
+    int             numIters;
+    int             numEps;
+    int             numGames;
+    int             batchSize;
+    int             numMCTSSims;
+    float           tempThreshold;
+    float           updateThreshold;
+    int             maxlenOfQueue;
+    int             numItersForTrainExamplesHistory;
+    int             arenaCompare;
+    char            checkpoint[MAX_FILENAME_LENGTH];
+} SelfPlayConfig;
+
+/**
+ * @struct TrainingExample
+ * @brief Represents a single training example
+ */
+typedef struct TrainingExample {
+    int             board[MAX_BOARD_SIZE];
+    float           pi[MAX_BOARD_SIZE];
+    float           v;
+} TrainingExample;
+
+/**
+ * @struct SelfPlayPipeline
+ * @brief Main structure for the self-play pipeline
+ */
+typedef struct SelfPlayPipeline {
+    IGame*          game;
+    INeuralNet*     nnet;
+    INeuralNet*     pnet;
+    MCTSState*      mcts;
+    SelfPlayConfig  config;
+    TrainingExample** trainExamplesHistory;
+    int             historySize;
+    int             skipFirstSelfPlay;
+
+    // GPU resources
+    curandState*    d_rng_states;
+    int*            d_boards;
+    float*          d_pis;
+    float*          d_vs;
+    MCTSNode*       d_mcts_nodes;
+    TrainingExample* d_examples;
+} SelfPlayPipeline;
