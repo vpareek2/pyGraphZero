@@ -7,6 +7,10 @@ __device__ __constant__ unsigned long long ZOBRIST_CASTLING[16];
 __device__ __constant__ unsigned long long ZOBRIST_EN_PASSANT[8];
 __device__ __constant__ unsigned long long ZOBRIST_SIDE_TO_MOVE;
 
+__device__ __constant__ U64 KING_ATTACKS[64];
+__device__ __constant__ U64 KNIGHT_ATTACKS[64];
+__device__ __constant__ U64 PAWN_ATTACKS[2][64];  // [color][square]
+
 // Initialize the chess game state
 __host__ __device__ void chess_init(IGame* self) {
 
@@ -854,16 +858,215 @@ __host__ __device__ void make_move(ChessBoard* board, int start, int end) {
 }
 
 
-__host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player);
-__host__ __device__ bool can_castle_queenside(const ChessBoard* board, int player);
+__host__ __device__ bool can_castle_kingside(const ChessBoard* board, int player) {
+    int king_pos = player == WHITE ? 4 : 60;
+    int rook_pos = player == WHITE ? 7 : 63;
+    
+    // Check if castling rights are still available
+    if (!board->castling_rights[player == WHITE ? 0 : 1][0]) {
+        return false;
+    }
+    
+    // Check if the squares between the king and rook are empty
+    for (int i = king_pos + 1; i < rook_pos; i++) {
+        if (board->pieces[i] != EMPTY) {
+            return false;
+        }
+    }
+    
+    // Check if the king is in check
+    if (is_square_attacked(board, king_pos, -player)) {
+        return false;
+    }
+    
+    // Check if the squares the king passes through are attacked
+    if (is_square_attacked(board, king_pos + 1, -player) ||
+        is_square_attacked(board, king_pos + 2, -player)) {
+        return false;
+    }
+    
+    return true;
+}
 
-__host__ __device__ U64 get_attacks(int piece, int square, U64 occupancy);
-__host__ __device__ U64 get_king_attacks(int square);
-__host__ __device__ U64 get_pawn_attacks(int square, int color);
-__host__ __device__ U64 get_knight_attacks(int square);
-__host__ __device__ U64 get_sliding_attacks(int piece, int square, U64 occupancy);
+__host__ __device__ bool can_castle_queenside(const ChessBoard* board, int player) {
+    int king_pos = player == WHITE ? 4 : 60;
+    int rook_pos = player == WHITE ? 0 : 56;
+    
+    // Check if castling rights are still available
+    if (!board->castling_rights[player == WHITE ? 0 : 1][1]) {
+        return false;
+    }
+    
+    // Check if the squares between the king and rook are empty
+    for (int i = rook_pos + 1; i < king_pos; i++) {
+        if (board->pieces[i] != EMPTY) {
+            return false;
+        }
+    }
+    
+    // Check if the king is in check
+    if (is_square_attacked(board, king_pos, -player)) {
+        return false;
+    }
+    
+    // Check if the squares the king passes through are attacked
+    if (is_square_attacked(board, king_pos - 1, -player) ||
+        is_square_attacked(board, king_pos - 2, -player)) {
+        return false;
+    }
+    
+    return true;
+}
+
+// Pre-computed lookup tables (should be initialized at program start)
+
+__host__ __device__ U64 get_attacks(int piece, int square, U64 occupancy) {
+    switch (abs(piece)) {
+        case KING:
+            return get_king_attacks(square);
+        case PAWN:
+            return get_pawn_attacks(square, piece > 0 ? WHITE : BLACK);
+        case KNIGHT:
+            return get_knight_attacks(square);
+        case BISHOP:
+            return get_sliding_attacks(BISHOP, square, occupancy);
+        case ROOK:
+            return get_sliding_attacks(ROOK, square, occupancy);
+        case QUEEN:
+            return get_sliding_attacks(BISHOP, square, occupancy) | 
+                   get_sliding_attacks(ROOK, square, occupancy);
+        default:
+            return 0ULL;  // Empty or invalid piece
+    }
+}
+
+__host__ __device__ U64 get_king_attacks(int square) {
+    return KING_ATTACKS[square];
+}
+
+__host__ __device__ U64 get_pawn_attacks(int square, int color) {
+    return PAWN_ATTACKS[color == WHITE ? 0 : 1][square];
+}
+
+__host__ __device__ U64 get_knight_attacks(int square) {
+    return KNIGHT_ATTACKS[square];
+}
+
+__host__ __device__ U64 get_sliding_attacks(int piece, int square, U64 occupancy) {
+    U64 attacks = 0ULL;
+    int directions[4][2] = {{1,0}, {0,1}, {1,1}, {1,-1}};
+    int start_dir = (piece == BISHOP) ? 2 : 0;
+    int end_dir = (piece == ROOK) ? 2 : 4;
+
+    for (int dir = start_dir; dir < end_dir; dir++) {
+        for (int i = 1; i < 8; i++) {
+            int rank = square / 8 + i * directions[dir][0];
+            int file = square % 8 + i * directions[dir][1];
+            if (rank < 0 || rank >= 8 || file < 0 || file >= 8) break;
+            
+            U64 square_bb = 1ULL << (rank * 8 + file);
+            attacks |= square_bb;
+            
+            if (occupancy & square_bb) break;
+        }
+        
+        for (int i = 1; i < 8; i++) {
+            int rank = square / 8 - i * directions[dir][0];
+            int file = square % 8 - i * directions[dir][1];
+            if (rank < 0 || rank >= 8 || file < 0 || file >= 8) break;
+            
+            U64 square_bb = 1ULL << (rank * 8 + file);
+            attacks |= square_bb;
+            
+            if (occupancy & square_bb) break;
+        }
+    }
+
+    return attacks;
+}
+
+// Helper function to initialize attack tables (call this at program start)
+void initialize_attack_tables() {
+    for (int sq = 0; sq < 64; sq++) {
+        U64 bb = 1ULL << sq;
+        int rank = sq / 8, file = sq % 8;
+
+        // King attacks
+        U64 king_att = ((bb << 1) & 0xfefefefefefefefeULL) | ((bb >> 1) & 0x7f7f7f7f7f7f7f7fULL);
+        king_att |= ((bb << 7) & 0x7f7f7f7f7f7f7f7fULL) | ((bb >> 7) & 0xfefefefefefefefeULL);
+        king_att |= (bb << 8) | (bb >> 8) | ((bb << 9) & 0xfefefefefefefefeULL) | ((bb >> 9) & 0x7f7f7f7f7f7f7f7fULL);
+        KING_ATTACKS[sq] = king_att;
+
+        // Knight attacks
+        U64 knight_att = 0ULL;
+        for (int i = 0; i < 8; i++) {
+            int r = rank + ((i < 4) ? 2 : -2) * (((i & 1) == 0) ? 1 : -1);
+            int f = file + ((i < 4) ? 1 : -1) * (((i & 1) == 0) ? 2 : -2);
+            if (r >= 0 && r < 8 && f >= 0 && f < 8)
+                knight_att |= 1ULL << (r * 8 + f);
+        }
+        KNIGHT_ATTACKS[sq] = knight_att;
+
+        // Pawn attacks
+        U64 white_pawn_att = ((bb << 7) & 0x7f7f7f7f7f7f7f7fULL) | ((bb << 9) & 0xfefefefefefefefeULL);
+        U64 black_pawn_att = ((bb >> 7) & 0xfefefefefefefefeULL) | ((bb >> 9) & 0x7f7f7f7f7f7f7f7fULL);
+        PAWN_ATTACKS[0][sq] = white_pawn_att;
+        PAWN_ATTACKS[1][sq] = black_pawn_att;
+    }
+}
 
 __host__ __device__ bool is_square_attacked(const ChessBoard* board, int square, int attacker) {
-    // Implementation to check if a square is under attack by the specified player
-    // This is used for castling checks
+    // Check pawn attacks
+    int pawn_direction = attacker == WHITE ? -1 : 1;
+    int pawn_rank = square / 8 + pawn_direction;
+    int pawn_file = square % 8;
+    if (pawn_rank >= 0 && pawn_rank < 8) {
+        if (pawn_file > 0 && board->pieces[pawn_rank * 8 + pawn_file - 1] == PAWN * attacker) return true;
+        if (pawn_file < 7 && board->pieces[pawn_rank * 8 + pawn_file + 1] == PAWN * attacker) return true;
+    }
+
+    // Check knight attacks
+    int knight_moves[8][2] = {{-2,-1}, {-2,1}, {-1,-2}, {-1,2}, {1,-2}, {1,2}, {2,-1}, {2,1}};
+    for (int i = 0; i < 8; i++) {
+        int rank = square / 8 + knight_moves[i][0];
+        int file = square % 8 + knight_moves[i][1];
+        if (rank >= 0 && rank < 8 && file >= 0 && file < 8) {
+            if (board->pieces[rank * 8 + file] == KNIGHT * attacker) return true;
+        }
+    }
+
+    // Check king attacks (needed for castling checks)
+    int king_moves[8][2] = {{-1,-1}, {-1,0}, {-1,1}, {0,-1}, {0,1}, {1,-1}, {1,0}, {1,1}};
+    for (int i = 0; i < 8; i++) {
+        int rank = square / 8 + king_moves[i][0];
+        int file = square % 8 + king_moves[i][1];
+        if (rank >= 0 && rank < 8 && file >= 0 && file < 8) {
+            if (board->pieces[rank * 8 + file] == KING * attacker) return true;
+        }
+    }
+
+    // Check sliding piece attacks (bishop, rook, queen)
+    int directions[8][2] = {{-1,-1}, {-1,0}, {-1,1}, {0,-1}, {0,1}, {1,-1}, {1,0}, {1,1}};
+    for (int i = 0; i < 8; i++) {
+        int rank = square / 8;
+        int file = square % 8;
+        while (true) {
+            rank += directions[i][0];
+            file += directions[i][1];
+            if (rank < 0 || rank >= 8 || file < 0 || file >= 8) break;
+            int piece = board->pieces[rank * 8 + file];
+            if (piece != EMPTY) {
+                if (piece * attacker > 0) {
+                    if ((i < 4 && abs(piece) == ROOK) ||
+                        (i >= 4 && abs(piece) == BISHOP) ||
+                        abs(piece) == QUEEN) {
+                        return true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    return false;
 }
