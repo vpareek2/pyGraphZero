@@ -213,6 +213,188 @@ void learn(SelfPlayPipeline* pipeline) {
     }
 }
 
+void execute_self_play_distributed(SelfPlayPipeline* pipeline, int world_rank, int world_size, ncclComm_t nccl_comm, cudaStream_t cuda_stream) {
+    int numGames = pipeline->config.numGames / world_size;
+    int numMCTSSims = pipeline->config.numMCTSSims;
+    int tempThreshold = pipeline->config.tempThreshold;
+    
+    // Initialize boards on GPU (only for this GPU's share of games)
+    thrust::host_vector<int> h_init_board(MAX_BOARD_SIZE);
+    pipeline->game->get_init_board(pipeline->game, h_init_board.data());
+    thrust::device_vector<int> d_boards(numGames * MAX_BOARD_SIZE, 0);
+    for (int i = 0; i < numGames; ++i) {
+        thrust::copy(h_init_board.begin(), h_init_board.end(), d_boards.begin() + i * MAX_BOARD_SIZE);
+    }
+
+    // Initialize other necessary arrays (only for this GPU's share of games)
+    thrust::device_vector<MCTSNode> d_mcts_roots(numGames);
+    thrust::device_vector<float> d_pis(numGames * MAX_BOARD_SIZE);
+    thrust::device_vector<float> d_vs(numGames);
+    thrust::device_vector<int> d_players(numGames, 1);
+
+    // Allocate memory for examples if not already allocated
+    if (pipeline->d_examples == nullptr) {
+        CUDA_CHECK(cudaMalloc(&pipeline->d_examples, numGames * MAX_GAME_LENGTH * sizeof(TrainingExample)));
+    }
+
+    // Launch parallel self-play kernel
+    dim3 grid((numGames + 255) / 256, 1, 1);
+    dim3 block(256, 1, 1);
+    
+    parallel_self_play_kernel<<<grid, block, 0, cuda_stream>>>(
+        thrust::raw_pointer_cast(d_mcts_roots.data()),
+        thrust::raw_pointer_cast(d_boards.data()),
+        thrust::raw_pointer_cast(d_pis.data()),
+        thrust::raw_pointer_cast(d_vs.data()),
+        thrust::raw_pointer_cast(d_players.data()),
+        pipeline->d_rng_states,
+        pipeline->game,
+        pipeline->nnet,
+        numGames,
+        numMCTSSims,
+        tempThreshold,
+        pipeline->d_examples
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Synchronize CUDA stream
+    CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+
+    // Gather results from all GPUs
+    thrust::host_vector<TrainingExample> h_examples(numGames * MAX_GAME_LENGTH);
+    CUDA_CHECK(cudaMemcpyAsync(h_examples.data(), pipeline->d_examples, 
+                               numGames * MAX_GAME_LENGTH * sizeof(TrainingExample), 
+                               cudaMemcpyDeviceToHost, cuda_stream));
+    CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+
+    // Use MPI to gather all examples to rank 0
+    int total_examples = numGames * MAX_GAME_LENGTH;
+    TrainingExample* all_examples = nullptr;
+    if (world_rank == 0) {
+        all_examples = (TrainingExample*)malloc(total_examples * world_size * sizeof(TrainingExample));
+    }
+
+    MPI_Gather(h_examples.data(), total_examples * sizeof(TrainingExample), MPI_BYTE,
+               all_examples, total_examples * sizeof(TrainingExample), MPI_BYTE,
+               0, MPI_COMM_WORLD);
+
+    // Process and store examples (only on rank 0)
+    if (world_rank == 0) {
+        int valid_examples = 0;
+        for (int i = 0; i < total_examples * world_size; i++) {
+            if (all_examples[i].board[0] == TERMINAL_STATE) {
+                break;
+            }
+            valid_examples++;
+        }
+
+        // Add examples to the training history
+        add_to_training_history(pipeline, all_examples, valid_examples);
+
+        free(all_examples);
+    }
+
+    // Synchronize all processes
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void learn_distributed(SelfPlayPipeline* pipeline, int world_rank, int world_size, ncclComm_t nccl_comm, cudaStream_t cuda_stream) {
+    // 1. Prepare training data (only on rank 0)
+    int total_examples = 0;
+    if (world_rank == 0) {
+        for (int i = 0; i < pipeline->historySize; i++) {
+            total_examples += pipeline->config.numEps * pipeline->config.numGames;
+        }
+    }
+
+    // Broadcast total_examples to all ranks
+    MPI_Bcast(&total_examples, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Allocate GPU memory for training data
+    int examples_per_gpu = (total_examples + world_size - 1) / world_size;
+    int* d_boards;
+    float* d_pis;
+    float* d_vs;
+    CUDA_CHECK(cudaMalloc(&d_boards, examples_per_gpu * MAX_BOARD_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pis, examples_per_gpu * MAX_BOARD_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_vs, examples_per_gpu * sizeof(float)));
+
+    // Distribute training examples across GPUs
+    if (world_rank == 0) {
+        // Copy training examples to GPU memory
+        int offset = 0;
+        for (int i = 0; i < pipeline->historySize; i++) {
+            int num_examples = pipeline->config.numEps * pipeline->config.numGames;
+            for (int gpu = 0; gpu < world_size; gpu++) {
+                int start = gpu * examples_per_gpu;
+                int end = min((gpu + 1) * examples_per_gpu, num_examples);
+                if (start < end) {
+                    MPI_Send(pipeline->trainExamplesHistory[i] + start, 
+                             (end - start) * sizeof(TrainingExample), MPI_BYTE, 
+                             gpu, 0, MPI_COMM_WORLD);
+                }
+            }
+            offset += num_examples;
+        }
+    }
+
+    // Receive training examples on each GPU
+    TrainingExample* h_examples = (TrainingExample*)malloc(examples_per_gpu * sizeof(TrainingExample));
+    MPI_Recv(h_examples, examples_per_gpu * sizeof(TrainingExample), MPI_BYTE, 
+             0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    // Copy received examples to GPU memory
+    for (int i = 0; i < examples_per_gpu; i++) {
+        CUDA_CHECK(cudaMemcpyAsync(d_boards + i * MAX_BOARD_SIZE, h_examples[i].board, 
+                                   MAX_BOARD_SIZE * sizeof(int), cudaMemcpyHostToDevice, cuda_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_pis + i * MAX_BOARD_SIZE, h_examples[i].pi, 
+                                   MAX_BOARD_SIZE * sizeof(float), cudaMemcpyHostToDevice, cuda_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_vs + i, &h_examples[i].v, 
+                                   sizeof(float), cudaMemcpyHostToDevice, cuda_stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+
+    free(h_examples);
+
+    // 2. Train the neural network (assuming this function can work with distributed GPU data)
+    pipeline->nnet->train_distributed(d_boards, d_pis, d_vs, examples_per_gpu, world_rank, world_size, nccl_comm, cuda_stream);
+
+    // 3. Free GPU memory
+    CUDA_CHECK(cudaFree(d_boards));
+    CUDA_CHECK(cudaFree(d_pis));
+    CUDA_CHECK(cudaFree(d_vs));
+
+    // 4. Evaluate the new network against the previous one (only on rank 0)
+    if (world_rank == 0) {
+        if (pit_against_previous_version(pipeline) > pipeline->config.updateThreshold) {
+            // Update the previous best network
+            pipeline->pnet->load_checkpoint(pipeline->nnet->get_checkpoint_file());
+            
+            // Save the new best network
+            char filename[512];
+            get_checkpoint_file(pipeline, pipeline->config.numIters, filename);
+            pipeline->nnet->save_checkpoint(filename);
+        } else {
+            // Revert to the previous best network
+            pipeline->nnet->load_checkpoint(pipeline->pnet->get_checkpoint_file());
+        }
+
+        // 5. Remove oldest examples if history is too long
+        if (pipeline->historySize >= pipeline->config.numItersForTrainExamplesHistory) {
+            free(pipeline->trainExamplesHistory[0]);
+            memmove(pipeline->trainExamplesHistory, pipeline->trainExamplesHistory + 1, 
+                    (pipeline->historySize - 1) * sizeof(TrainingExample*));
+            pipeline->historySize--;
+        }
+    }
+
+    // Broadcast the updated network weights to all GPUs
+    pipeline->nnet->broadcast_weights(world_rank, world_size, nccl_comm, cuda_stream);
+
+    // Synchronize all processes
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
 __global__ void init_rng(curandState* states, unsigned long seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     curand_init(seed, idx, 0, &states[idx]);

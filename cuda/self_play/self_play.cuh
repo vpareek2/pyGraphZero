@@ -8,6 +8,8 @@
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include <mpi.h>
+#include <nccl.h>
 
 #include "../games/game.cuh"
 #include "../networks/neural_network.h"
@@ -117,6 +119,22 @@ void              execute_self_play(
  */
 void              learn(
     SelfPlayPipeline* pipeline
+);
+
+void execute_self_play_distributed(
+    SelfPlayPipeline* pipeline,
+    int world_rank,
+    int world_size,
+    ncclComm_t nccl_comm,
+    cudaStream_t cuda_stream
+);
+
+void learn_distributed(
+    SelfPlayPipeline* pipeline,
+    int world_rank,
+    int world_size,
+    ncclComm_t nccl_comm,
+    cudaStream_t cuda_stream
 );
 
 // CUDA kernel function prototypes

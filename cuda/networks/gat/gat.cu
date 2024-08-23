@@ -6,6 +6,8 @@
 #include <cublas_v2.h>
 #include <thrust/device_vector.h>
 #include <thrust/transform_reduce.h>
+#include <nccl.h>
+#include <mpi.h>
 
 /*************************************************************************************************************************************************************
  * CUDA ERROR CHECKING
@@ -14,7 +16,13 @@
 #define CUDNN_CHECK(call) { cudnnStatus_t status = call; if (status != CUDNN_STATUS_SUCCESS) { fprintf(stderr, "CUDNN error at %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(status)); exit(1); } }
 #define CUDA_CHECK(call) { cudaError_t status = call; if (status != cudaSuccess) { fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); exit(1); } }
 #define CURAND_CHECK(call) { curandStatus_t status = call; if (status != CURAND_STATUS_SUCCESS) { fprintf(stderr, "CURAND error at %s:%d: %d\n", __FILE__, __LINE__, status); exit(1); } }
-
+#define NCCL_CHECK(call) { \
+    ncclResult_t status = call; \
+    if (status != ncclSuccess) { \
+        fprintf(stderr, "NCCL error at %s:%d: %s\n", __FILE__, __LINE__, ncclGetErrorString(status)); \
+        exit(1); \
+    } \
+}
 /*************************************************************************************************************************************************************/
 
 static void gat_init(INeuralNet* self, const IGame* game) {
@@ -370,6 +378,125 @@ static void gat_destroy(INeuralNet* self) {
     free(wrapper);
 }
 
+static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pis, float* d_vs, int num_examples, int world_rank, int world_size, ncclComm_t nccl_comm, cudaStream_t cuda_stream) {
+    GATWrapper* wrapper = (GATWrapper*)self;
+    GATModel* model = &wrapper->model;
+
+    int examples_per_gpu = (num_examples + world_size - 1) / world_size;
+    int local_examples = min(examples_per_gpu, num_examples - world_rank * examples_per_gpu);
+
+    for (int epoch = 0; epoch < model->config.epochs; epoch++) {
+        float pi_loss_sum = 0.0f;
+        float v_loss_sum = 0.0f;
+        int batch_count = (local_examples + model->config.batch_size - 1) / model->config.batch_size;
+
+        for (int batch = 0; batch < batch_count; batch++) {
+            int batch_start = batch * model->config.batch_size;
+            int batch_size = min(model->config.batch_size, local_examples - batch_start);
+
+            // Forward pass
+            float *out_pi, *out_v;
+            CUDA_CHECK(cudaMalloc(&out_pi, batch_size * model->config.num_actions * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&out_v, batch_size * sizeof(float)));
+            forward_gat(model, d_boards + batch_start * model->config.input_features, &out_pi, &out_v);
+
+            // Compute losses
+            auto [pi_loss, v_loss] = compute_losses(d_pis + batch_start * model->config.num_actions, 
+                                                    d_vs + batch_start, 
+                                                    out_pi, out_v, 
+                                                    batch_size, model->config.num_actions);
+            pi_loss_sum += pi_loss;
+            v_loss_sum += v_loss;
+
+            // Backward pass
+            backward_gat(model, d_boards + batch_start * model->config.input_features, 
+                         d_pis + batch_start * model->config.num_actions, 
+                         d_vs + batch_start, out_pi, out_v);
+
+            // Clean up
+            CUDA_CHECK(cudaFree(out_pi));
+            CUDA_CHECK(cudaFree(out_v));
+        }
+
+        // Aggregate gradients across GPUs
+        for (int i = 0; i < model->config.num_layers; i++) {
+            NCCL_CHECK(ncclAllReduce(model->d_layer_weights[i], model->d_layer_weights[i], 
+                                     model->config.hidden_features * model->config.hidden_features, 
+                                     ncclFloat32, ncclSum, nccl_comm, cuda_stream));
+            NCCL_CHECK(ncclAllReduce(model->d_attention_weights[i], model->d_attention_weights[i], 
+                                     model->config.num_heads * 2 * model->config.hidden_features, 
+                                     ncclFloat32, ncclSum, nccl_comm, cuda_stream));
+        }
+        NCCL_CHECK(ncclAllReduce(model->d_value_weights, model->d_value_weights, 
+                                 model->config.hidden_features, ncclFloat32, ncclSum, 
+                                 nccl_comm, cuda_stream));
+        NCCL_CHECK(ncclAllReduce(model->d_policy_weights, model->d_policy_weights, 
+                                 model->config.hidden_features * model->config.num_actions, 
+                                 ncclFloat32, ncclSum, nccl_comm, cuda_stream));
+
+        // Update weights using Adam optimizer
+        model->optimizer->step();
+        model->optimizer->zero_grad();
+
+        // Synchronize CUDA stream
+        CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+
+        // Compute global average losses
+        float global_pi_loss, global_v_loss;
+        MPI_Allreduce(&pi_loss_sum, &global_pi_loss, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(&v_loss_sum, &global_v_loss, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+        global_pi_loss /= (num_examples * world_size);
+        global_v_loss /= (num_examples * world_size);
+
+        if (world_rank == 0) {
+            printf("Epoch %d, Average Policy Loss: %f, Average Value Loss: %f\n", 
+                   epoch + 1, global_pi_loss, global_v_loss);
+        }
+    }
+}
+
+static void gat_broadcast_weights(INeuralNet* self, int world_rank, int world_size, ncclComm_t nccl_comm, cudaStream_t cuda_stream) {
+    GATWrapper* wrapper = (GATWrapper*)self;
+    GATModel* model = &wrapper->model;
+
+    // Broadcast input weights
+    NCCL_CHECK(ncclBroadcast(model->input_weights, model->input_weights, 
+                             model->config.input_features * model->config.hidden_features, 
+                             ncclFloat32, 0, nccl_comm, cuda_stream));
+    NCCL_CHECK(ncclBroadcast(model->input_bias, model->input_bias, 
+                             model->config.hidden_features, 
+                             ncclFloat32, 0, nccl_comm, cuda_stream));
+
+    // Broadcast GAT layer weights
+    for (int i = 0; i < model->config.num_layers; i++) {
+        NCCL_CHECK(ncclBroadcast(model->layer_weights[i], model->layer_weights[i], 
+                                 model->config.hidden_features * model->config.hidden_features, 
+                                 ncclFloat32, 0, nccl_comm, cuda_stream));
+        NCCL_CHECK(ncclBroadcast(model->layer_biases[i], model->layer_biases[i], 
+                                 model->config.hidden_features, 
+                                 ncclFloat32, 0, nccl_comm, cuda_stream));
+        NCCL_CHECK(ncclBroadcast(model->attention_weights[i], model->attention_weights[i], 
+                                 model->config.num_heads * 2 * model->config.hidden_features, 
+                                 ncclFloat32, 0, nccl_comm, cuda_stream));
+    }
+
+    // Broadcast output weights
+    NCCL_CHECK(ncclBroadcast(model->value_weights, model->value_weights, 
+                             model->config.hidden_features, 
+                             ncclFloat32, 0, nccl_comm, cuda_stream));
+    NCCL_CHECK(ncclBroadcast(model->value_bias, model->value_bias, 
+                             1, ncclFloat32, 0, nccl_comm, cuda_stream));
+    NCCL_CHECK(ncclBroadcast(model->policy_weights, model->policy_weights, 
+                             model->config.hidden_features * model->config.num_actions, 
+                             ncclFloat32, 0, nccl_comm, cuda_stream));
+    NCCL_CHECK(ncclBroadcast(model->policy_bias, model->policy_bias, 
+                             model->config.num_actions, 
+                             ncclFloat32, 0, nccl_comm, cuda_stream));
+
+    // Synchronize CUDA stream
+    CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+}
+
 INeuralNet* create_gat_model(const IGame* game) {
     GATWrapper* wrapper = (GATWrapper*)malloc(sizeof(GATWrapper));
     wrapper->base.impl = wrapper;
@@ -379,6 +506,8 @@ INeuralNet* create_gat_model(const IGame* game) {
     wrapper->base.save_checkpoint = gat_save_checkpoint;
     wrapper->base.load_checkpoint = gat_load_checkpoint;
     wrapper->base.destroy = gat_destroy;
+    wrapper->base.train_distributed = gat_train_distributed;
+    wrapper->base.broadcast_weights = gat_broadcast_weights;
 
     gat_init(&wrapper->base, game);
 

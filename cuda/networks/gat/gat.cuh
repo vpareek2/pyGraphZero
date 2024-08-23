@@ -87,6 +87,10 @@ static void gat_save_checkpoint(INeuralNet* self, const char* folder, const char
 static void gat_load_checkpoint(INeuralNet* self, const char* folder, const char* filename);
 static void gat_destroy(INeuralNet* self);
 
+// Distributed stuff
+static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pis, float* d_vs, int num_examples, int world_rank, int world_size, ncclComm_t nccl_comm, cudaStream_t cuda_stream);
+static void gat_broadcast_weights(INeuralNet* self, int world_rank, int world_size, ncclComm_t nccl_comm, cudaStream_t cuda_stream);
+
 // Helper function prototypes
 static void init_model_config(GATModel* model, const IGame* game);
 static void init_input_block(GATModel* model);
