@@ -150,3 +150,11 @@ Memory Management: Carefully manage GPU memory, especially for large game trees 
 Communication Overhead: Minimize data transfer between CPUs and GPUs, and between GPUs.
 Synchronization: Carefully manage synchronization points to maintain algorithmic correctness while maximizing parallelism.
 Fault Tolerance: Implement checkpoint-restart capabilities to recover from potential GPU or node failures.
+
+As you go through each file, consider the following:
+
+How does this file need to change to support multi-GPU operations?
+Are there any data structures or algorithms that need to be modified for distributed processing?
+How can you ensure efficient communication between GPUs in this part of the code?
+Are there any potential bottlenecks that could be optimized?
+How does this file interact with others, and are those interactions still valid in a distributed context?
