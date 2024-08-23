@@ -21,6 +21,8 @@ typedef struct Arena {
     Player*          player1;      // Player 1
     Player*          player2;      // Player 2
     IGame*           game;         // Game instance
+    int*             board;
+    int*             board_size;
 } Arena;
 
 /**

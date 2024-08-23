@@ -1,0 +1,35 @@
+cuda/main.cu
+This file contains the main function for a CUDA-based application that initializes a game environment, creates game and neural network instances, and runs a self-play training loop.
+cuda/networks/gat/gat.cu
+This file implements the Graph Attention Network (GAT) model, including functions for saving and loading model checkpoints, as well as forward and backward passes through the network.
+cuda/games/chess/chess.cuh
+This header file defines the Chess game structure and its associated functions, including initialization, board state management, and game rules.
+cuda/self_play/self_play.cuh
+This header file outlines the self-play pipeline structure and its configuration, along with function prototypes for creating, executing, and managing self-play processes.
+cuda/networks/resnet/resnet.cuh
+This header file defines the ResNet model structure and configuration, including function prototypes for initialization, training, prediction, and checkpoint management.
+cuda/games/connect4/connect4.cuh
+This header file defines the Connect4 game structure and its associated functions, including initialization, board state management, and game rules.
+cuda/self_play/self_play.cu
+This file implements the self-play pipeline, including functions for executing self-play, learning from training examples, and managing the training history.
+cuda/games/connect4/connect4.cu
+This file contains the implementation of the Connect4 game functions, including board initialization, state transitions, and game evaluation.
+cuda/networks/resnet/resnet.cu
+This file implements the ResNet model, including functions for initialization, training, prediction, and saving/loading model checkpoints.
+cuda/games/game.cuh
+This header file defines the interface for game structures, including function pointers for game management and state evaluation.
+cuda/games/tictactoe/tictactoe.cuh
+This header file defines the TicTacToe game structure and its associated functions, including initialization, board state management, and game rules.
+cuda/config/config.h
+This header file defines the global configuration structure for the application, including parameters for the game, MCTS, neural networks, and self-play.
+cuda/mcts/mcts.cuh
+This header file defines the Monte Carlo Tree Search (MCTS) structure and functions, including node representation and evaluation methods.
+cuda/mcts/mcts.cu
+This file implements the MCTS algorithm, including functions for initializing random number generators and running MCTS in batches.
+
+
+Before I start with the unit testing, I'd like you to take a look through the files. Kind of like you are a senior software engineer reviewing a new grad's code.
+
+I am going to give you a header file and an implementation file. Look through the files thoroughly, looking for discrepancies, errors, and even ways to optimize the code. Do your best work here, I'd like to enter testing with as few bugs as possible.
+
+Here are the first 2 files.
