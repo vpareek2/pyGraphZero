@@ -382,8 +382,19 @@ static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pi
     GATWrapper* wrapper = (GATWrapper*)self;
     GATModel* model = &wrapper->model;
 
+    // Efficient data distribution
     int examples_per_gpu = (num_examples + world_size - 1) / world_size;
     int local_examples = min(examples_per_gpu, num_examples - world_rank * examples_per_gpu);
+
+    // Broadcast initial data to all GPUs
+    NCCL_CHECK(ncclBroadcast(d_boards, d_boards, num_examples * model->config.input_features * sizeof(float), ncclFloat32, 0, nccl_comm, cuda_stream));
+    NCCL_CHECK(ncclBroadcast(d_pis, d_pis, num_examples * model->config.num_actions * sizeof(float), ncclFloat32, 0, nccl_comm, cuda_stream));
+    NCCL_CHECK(ncclBroadcast(d_vs, d_vs, num_examples * sizeof(float), ncclFloat32, 0, nccl_comm, cuda_stream));
+
+    // Model parallelism: Divide layers across GPUs
+    int layers_per_gpu = (model->config.num_layers + world_size - 1) / world_size;
+    int start_layer = world_rank * layers_per_gpu;
+    int end_layer = min((world_rank + 1) * layers_per_gpu, model->config.num_layers);
 
     for (int epoch = 0; epoch < model->config.epochs; epoch++) {
         float pi_loss_sum = 0.0f;
@@ -394,11 +405,30 @@ static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pi
             int batch_start = batch * model->config.batch_size;
             int batch_size = min(model->config.batch_size, local_examples - batch_start);
 
-            // Forward pass
+            // Forward pass with model parallelism
             float *out_pi, *out_v;
             CUDA_CHECK(cudaMalloc(&out_pi, batch_size * model->config.num_actions * sizeof(float)));
             CUDA_CHECK(cudaMalloc(&out_v, batch_size * sizeof(float)));
-            forward_gat(model, d_boards + batch_start * model->config.input_features, &out_pi, &out_v);
+            
+            float* layer_input = d_boards + batch_start * model->config.input_features;
+            float* layer_output;
+            CUDA_CHECK(cudaMalloc(&layer_output, batch_size * model->config.hidden_features * sizeof(float)));
+
+            for (int layer = start_layer; layer < end_layer; layer++) {
+                forward_gat_layer(model, layer, layer_input, layer_output, batch_size);
+                
+                // Communicate layer output to next GPU
+                if (layer < model->config.num_layers - 1) {
+                    int next_rank = (world_rank + 1) % world_size;
+                    NCCL_CHECK(ncclSend(layer_output, batch_size * model->config.hidden_features, ncclFloat32, next_rank, nccl_comm, cuda_stream));
+                    NCCL_CHECK(ncclRecv(layer_input, batch_size * model->config.hidden_features, ncclFloat32, (world_rank - 1 + world_size) % world_size, nccl_comm, cuda_stream));
+                }
+            }
+
+            // Final output layer
+            if (world_rank == world_size - 1) {
+                compute_output(model, layer_output, out_pi, out_v, batch_size);
+            }
 
             // Compute losses
             auto [pi_loss, v_loss] = compute_losses(d_pis + batch_start * model->config.num_actions, 
@@ -408,35 +438,50 @@ static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pi
             pi_loss_sum += pi_loss;
             v_loss_sum += v_loss;
 
-            // Backward pass
-            backward_gat(model, d_boards + batch_start * model->config.input_features, 
-                         d_pis + batch_start * model->config.num_actions, 
-                         d_vs + batch_start, out_pi, out_v);
+            // Backward pass with model parallelism
+            float* grad_input;
+            CUDA_CHECK(cudaMalloc(&grad_input, batch_size * model->config.hidden_features * sizeof(float)));
+
+            for (int layer = end_layer - 1; layer >= start_layer; layer--) {
+                backward_gat_layer(model, layer, layer_input, layer_output, grad_input, batch_size);
+
+                // Communicate gradients to previous GPU
+                if (layer > 0) {
+                    int prev_rank = (world_rank - 1 + world_size) % world_size;
+                    NCCL_CHECK(ncclSend(grad_input, batch_size * model->config.hidden_features, ncclFloat32, prev_rank, nccl_comm, cuda_stream));
+                    NCCL_CHECK(ncclRecv(grad_input, batch_size * model->config.hidden_features, ncclFloat32, (world_rank + 1) % world_size, nccl_comm, cuda_stream));
+                }
+            }
+
+            // Aggregate gradients across GPUs
+            for (int i = start_layer; i < end_layer; i++) {
+                NCCL_CHECK(ncclAllReduce(model->d_layer_weights[i], model->d_layer_weights[i], 
+                                         model->config.hidden_features * model->config.hidden_features, 
+                                         ncclFloat32, ncclSum, nccl_comm, cuda_stream));
+                NCCL_CHECK(ncclAllReduce(model->d_attention_weights[i], model->d_attention_weights[i], 
+                                         model->config.num_heads * 2 * model->config.hidden_features, 
+                                         ncclFloat32, ncclSum, nccl_comm, cuda_stream));
+            }
+
+            if (world_rank == world_size - 1) {
+                NCCL_CHECK(ncclAllReduce(model->d_value_weights, model->d_value_weights, 
+                                         model->config.hidden_features, ncclFloat32, ncclSum, 
+                                         nccl_comm, cuda_stream));
+                NCCL_CHECK(ncclAllReduce(model->d_policy_weights, model->d_policy_weights, 
+                                         model->config.hidden_features * model->config.num_actions, 
+                                         ncclFloat32, ncclSum, nccl_comm, cuda_stream));
+            }
+
+            // Update weights using Adam optimizer
+            model->optimizer->step();
+            model->optimizer->zero_grad();
 
             // Clean up
             CUDA_CHECK(cudaFree(out_pi));
             CUDA_CHECK(cudaFree(out_v));
+            CUDA_CHECK(cudaFree(layer_output));
+            CUDA_CHECK(cudaFree(grad_input));
         }
-
-        // Aggregate gradients across GPUs
-        for (int i = 0; i < model->config.num_layers; i++) {
-            NCCL_CHECK(ncclAllReduce(model->d_layer_weights[i], model->d_layer_weights[i], 
-                                     model->config.hidden_features * model->config.hidden_features, 
-                                     ncclFloat32, ncclSum, nccl_comm, cuda_stream));
-            NCCL_CHECK(ncclAllReduce(model->d_attention_weights[i], model->d_attention_weights[i], 
-                                     model->config.num_heads * 2 * model->config.hidden_features, 
-                                     ncclFloat32, ncclSum, nccl_comm, cuda_stream));
-        }
-        NCCL_CHECK(ncclAllReduce(model->d_value_weights, model->d_value_weights, 
-                                 model->config.hidden_features, ncclFloat32, ncclSum, 
-                                 nccl_comm, cuda_stream));
-        NCCL_CHECK(ncclAllReduce(model->d_policy_weights, model->d_policy_weights, 
-                                 model->config.hidden_features * model->config.num_actions, 
-                                 ncclFloat32, ncclSum, nccl_comm, cuda_stream));
-
-        // Update weights using Adam optimizer
-        model->optimizer->step();
-        model->optimizer->zero_grad();
 
         // Synchronize CUDA stream
         CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
