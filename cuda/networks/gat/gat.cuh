@@ -50,8 +50,10 @@ typedef struct {
     float **layer_bn_save_means, **layer_bn_save_vars;
     float *value_bn_save_mean, *value_bn_save_var, *policy_bn_save_mean, *policy_bn_save_var;
 
-    // CUDNN handles
+    // CUDNN & CUBLAS handle
     cudnnHandle_t cudnn_handle;
+    cublasHandle_t cublas_handle;
+
 
     // Model configuration
     ModelConfig config;
@@ -102,5 +104,7 @@ static void forward_gat(GATModel* model, float* batch_boards, float** out_pi, fl
 static std::pair<float, float> compute_losses(float* target_pi, float* target_v, float* out_pi, float* out_v, int batch_size, int action_size);
 static void backward_gat(GATModel* model, float* batch_boards, float* target_pi, float* target_v, float* out_pi, float* out_v);
 static void adam_update(torch::optim::Adam& optimizer);
+static void compute_initial_grad_output(GATModel* model, float* d_policy, float* d_value, float* grad_output, int batch_size);
+
 
 #endif // GAT_CUH

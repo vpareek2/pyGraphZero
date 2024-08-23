@@ -546,42 +546,136 @@ static void gat_broadcast_weights(INeuralNet* self, int world_rank, int world_si
     GATWrapper* wrapper = (GATWrapper*)self;
     GATModel* model = &wrapper->model;
 
-    // Broadcast input weights
-    NCCL_CHECK(ncclBroadcast(model->input_weights, model->input_weights, 
-                             model->config.input_features * model->config.hidden_features, 
-                             ncclFloat32, 0, nccl_comm, cuda_stream));
-    NCCL_CHECK(ncclBroadcast(model->input_bias, model->input_bias, 
-                             model->config.hidden_features, 
-                             ncclFloat32, 0, nccl_comm, cuda_stream));
+    // Create CUDA events for timing
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, cuda_stream));
 
-    // Broadcast GAT layer weights
+    // Calculate total size of all weights
+    size_t total_weight_size = 0;
+    total_weight_size += model->config.input_features * model->config.hidden_features; // input_weights
+    total_weight_size += model->config.hidden_features; // input_bias
     for (int i = 0; i < model->config.num_layers; i++) {
-        NCCL_CHECK(ncclBroadcast(model->layer_weights[i], model->layer_weights[i], 
-                                 model->config.hidden_features * model->config.hidden_features, 
-                                 ncclFloat32, 0, nccl_comm, cuda_stream));
-        NCCL_CHECK(ncclBroadcast(model->layer_biases[i], model->layer_biases[i], 
-                                 model->config.hidden_features, 
-                                 ncclFloat32, 0, nccl_comm, cuda_stream));
-        NCCL_CHECK(ncclBroadcast(model->attention_weights[i], model->attention_weights[i], 
-                                 model->config.num_heads * 2 * model->config.hidden_features, 
-                                 ncclFloat32, 0, nccl_comm, cuda_stream));
+        total_weight_size += model->config.hidden_features * model->config.hidden_features; // layer_weights
+        total_weight_size += model->config.hidden_features; // layer_biases
+        total_weight_size += model->config.num_heads * 2 * model->config.hidden_features; // attention_weights
+    }
+    total_weight_size += model->config.hidden_features; // value_weights
+    total_weight_size += 1; // value_bias
+    total_weight_size += model->config.hidden_features * model->config.num_actions; // policy_weights
+    total_weight_size += model->config.num_actions; // policy_bias
+
+    // Allocate a single contiguous buffer for all weights
+    float* all_weights;
+    CUDA_CHECK(cudaMalloc(&all_weights, total_weight_size * sizeof(float)));
+
+    // Copy all weights into the contiguous buffer
+    size_t offset = 0;
+    CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->input_weights, 
+                               model->config.input_features * model->config.hidden_features * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += model->config.input_features * model->config.hidden_features;
+    CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->input_bias, 
+                               model->config.hidden_features * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += model->config.hidden_features;
+
+    for (int i = 0; i < model->config.num_layers; i++) {
+        CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->layer_weights[i], 
+                                   model->config.hidden_features * model->config.hidden_features * sizeof(float), 
+                                   cudaMemcpyDeviceToDevice, cuda_stream));
+        offset += model->config.hidden_features * model->config.hidden_features;
+        CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->layer_biases[i], 
+                                   model->config.hidden_features * sizeof(float), 
+                                   cudaMemcpyDeviceToDevice, cuda_stream));
+        offset += model->config.hidden_features;
+        CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->attention_weights[i], 
+                                   model->config.num_heads * 2 * model->config.hidden_features * sizeof(float), 
+                                   cudaMemcpyDeviceToDevice, cuda_stream));
+        offset += model->config.num_heads * 2 * model->config.hidden_features;
     }
 
-    // Broadcast output weights
-    NCCL_CHECK(ncclBroadcast(model->value_weights, model->value_weights, 
-                             model->config.hidden_features, 
-                             ncclFloat32, 0, nccl_comm, cuda_stream));
-    NCCL_CHECK(ncclBroadcast(model->value_bias, model->value_bias, 
-                             1, ncclFloat32, 0, nccl_comm, cuda_stream));
-    NCCL_CHECK(ncclBroadcast(model->policy_weights, model->policy_weights, 
-                             model->config.hidden_features * model->config.num_actions, 
-                             ncclFloat32, 0, nccl_comm, cuda_stream));
-    NCCL_CHECK(ncclBroadcast(model->policy_bias, model->policy_bias, 
-                             model->config.num_actions, 
-                             ncclFloat32, 0, nccl_comm, cuda_stream));
+    CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->value_weights, 
+                               model->config.hidden_features * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += model->config.hidden_features;
+    CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->value_bias, 
+                               sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += 1;
+    CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->policy_weights, 
+                               model->config.hidden_features * model->config.num_actions * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += model->config.hidden_features * model->config.num_actions;
+    CUDA_CHECK(cudaMemcpyAsync(all_weights + offset, model->policy_bias, 
+                               model->config.num_actions * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
 
-    // Synchronize CUDA stream
-    CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+    // Perform ring-allreduce operation
+    NCCL_CHECK(ncclAllReduce(all_weights, all_weights, total_weight_size, ncclFloat32, ncclSum, nccl_comm, cuda_stream));
+
+    // Divide by world_size to get the average
+    float scale = 1.0f / world_size;
+    CUDA_CHECK(cublasSscal(model->cublas_handle, total_weight_size, &scale, all_weights, 1));
+
+    // Copy the synchronized weights back to their original locations
+    offset = 0;
+    CUDA_CHECK(cudaMemcpyAsync(model->input_weights, all_weights + offset, 
+                               model->config.input_features * model->config.hidden_features * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += model->config.input_features * model->config.hidden_features;
+    CUDA_CHECK(cudaMemcpyAsync(model->input_bias, all_weights + offset, 
+                               model->config.hidden_features * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += model->config.hidden_features;
+
+    for (int i = 0; i < model->config.num_layers; i++) {
+        CUDA_CHECK(cudaMemcpyAsync(model->layer_weights[i], all_weights + offset, 
+                                   model->config.hidden_features * model->config.hidden_features * sizeof(float), 
+                                   cudaMemcpyDeviceToDevice, cuda_stream));
+        offset += model->config.hidden_features * model->config.hidden_features;
+        CUDA_CHECK(cudaMemcpyAsync(model->layer_biases[i], all_weights + offset, 
+                                   model->config.hidden_features * sizeof(float), 
+                                   cudaMemcpyDeviceToDevice, cuda_stream));
+        offset += model->config.hidden_features;
+        CUDA_CHECK(cudaMemcpyAsync(model->attention_weights[i], all_weights + offset, 
+                                   model->config.num_heads * 2 * model->config.hidden_features * sizeof(float), 
+                                   cudaMemcpyDeviceToDevice, cuda_stream));
+        offset += model->config.num_heads * 2 * model->config.hidden_features;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(model->value_weights, all_weights + offset, 
+                               model->config.hidden_features * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += model->config.hidden_features;
+    CUDA_CHECK(cudaMemcpyAsync(model->value_bias, all_weights + offset, 
+                               sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += 1;
+    CUDA_CHECK(cudaMemcpyAsync(model->policy_weights, all_weights + offset, 
+                               model->config.hidden_features * model->config.num_actions * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+    offset += model->config.hidden_features * model->config.num_actions;
+    CUDA_CHECK(cudaMemcpyAsync(model->policy_bias, all_weights + offset, 
+                               model->config.num_actions * sizeof(float), 
+                               cudaMemcpyDeviceToDevice, cuda_stream));
+
+    // Free the temporary buffer
+    CUDA_CHECK(cudaFree(all_weights));
+
+    // Record end time and calculate duration
+    CUDA_CHECK(cudaEventRecord(stop, cuda_stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+    
+    if (world_rank == 0) {
+        printf("Weight synchronization time: %f ms\n", milliseconds);
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 }
 
 INeuralNet* create_gat_model(const IGame* game) {
@@ -981,4 +1075,35 @@ __global__ void backward_activation(float* inputs, float* grad_output, int size)
     if (idx < size) {
         grad_output[idx] *= (inputs[idx] > 0.0f) ? 1.0f : 0.2f;  // LeakyReLU gradient
     }
+}
+
+// Compute initial gradient output for the backward pass
+static void compute_initial_grad_output(GATModel* model, float* d_policy, float* d_value, float* grad_output, int batch_size) {
+    cublasHandle_t cublas;
+    CUDA_CHECK(cublasCreate(&cublas));
+
+    float alpha = 1.0f, beta = 0.0f;
+
+    // Compute gradient for policy head
+    CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                model->config.hidden_features, batch_size, model->config.num_actions,
+                &alpha, model->policy_weights, model->config.hidden_features,
+                d_policy, model->config.num_actions,
+                &beta, grad_output, model->config.hidden_features));
+
+    // Compute gradient for value head and add it to grad_output
+    CUDA_CHECK(cublasSger(cublas, model->config.hidden_features, batch_size,
+               &alpha, model->value_weights, 1,
+               d_value, 1,
+               grad_output, model->config.hidden_features));
+
+    CUDA_CHECK(cublasDestroy(cublas));
+
+    // Apply activation gradient (LeakyReLU)
+    dim3 grid((batch_size * model->config.hidden_features + 255) / 256);
+    dim3 block(256);
+    backward_activation<<<grid, block>>>(model->layer_outputs[model->config.num_layers - 1],
+                                         grad_output,
+                                         batch_size * model->config.hidden_features);
+    CUDA_CHECK(cudaGetLastError());
 }
