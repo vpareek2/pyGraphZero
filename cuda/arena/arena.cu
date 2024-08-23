@@ -4,9 +4,27 @@
 
 Arena* create_arena(Player* player1, Player* player2, IGame* game) {
     Arena* arena = (Arena*)malloc(sizeof(Arena)); // Allocate memory for the arena
+    if (arena == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory for the arena\n");
+        return NULL;
+    }
     arena->player1 = player1; // Initialize player 1
     arena->player2 = player2; // Initialize player 2
     arena->game = game; // Initialize game instance
+    arena->board_size = (int*)malloc(sizeof(int)); // Allocate memory for the board size
+    if (arena->board_size == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory for the board size\n");
+        free(arena); // Free arena memory
+        return NULL;
+    }
+    *arena->board_size = MAX_BOARD_SIZE; // Set the board size
+    arena->board = (int*)malloc(sizeof(int) * *arena->board_size); // Allocate memory for the board
+    if (arena->board == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory for the board\n");
+        free(arena->board_size); // Free board size memory
+        free(arena); // Free arena memory
+        return NULL;
+    }
     return arena;
 }
 
@@ -26,11 +44,11 @@ int play_game(Arena* arena, bool verbose) {
             return 0; // Draw or handle error as appropriate
         }
         
-        int next_board[MAX_BOARD_SIZE];
+        int next_board[*arena->board_size];
         int next_player;
         arena->game->get_next_state(arena->game, board, current_player, action, next_board, &next_player);
         
-        memcpy(board, next_board, sizeof(int) * arena->board_size);
+        memcpy(board, next_board, sizeof(int) * *arena->board_size);
         current_player = next_player;
         
         game_result = arena->game->get_game_ended(arena->game, board, current_player);
@@ -64,5 +82,7 @@ void play_games(Arena* arena, int num_games, int* wins, int* losses, int* draws)
 }
 
 void destroy_arena(Arena* arena) {
+    free(arena->board); // Free board memory
+    free(arena->board_size); // Free board size memory
     free(arena); // Free arena memory
 }
