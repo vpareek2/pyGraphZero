@@ -29,6 +29,22 @@ Arena* create_arena(Player* player1, Player* player2, IGame* game) {
 }
 
 int play_game(Arena* arena, bool verbose) {
+    if (arena == NULL) {
+        fprintf(stderr, "Error: Arena is NULL\n");
+        return 0; // Return error
+    }
+    if (arena->board == NULL) {
+        fprintf(stderr, "Error: Board is NULL\n");
+        return 0; // Return error
+    }
+    if (arena->board_size == NULL) {
+        fprintf(stderr, "Error: Board size is NULL\n");
+        return 0; // Return error
+    }
+    if (arena->game == NULL) {
+        fprintf(stderr, "Error: Game is NULL\n");
+        return 0; // Return error
+    }
     int* board = arena->board;
     arena->game->get_init_board(arena->game, board);
     
@@ -37,6 +53,10 @@ int play_game(Arena* arena, bool verbose) {
     
     while (game_result == 0) {
         Player* current_player_obj = (current_player == 1) ? arena->player1 : arena->player2;
+        if (current_player_obj == NULL) {
+            fprintf(stderr, "Error: Current player object is NULL\n");
+            return 0; // Return error
+        }
         int action = current_player_obj->get_action(current_player_obj, board);
         
         if (!arena->game->is_valid_action(arena->game, board, action)) {
@@ -62,6 +82,10 @@ int play_game(Arena* arena, bool verbose) {
 }
 
 void play_games(Arena* arena, int num_games, int* wins, int* losses, int* draws) {
+    if (arena == NULL) {
+        fprintf(stderr, "Error: Arena is NULL\n");
+        return; // Exit early if arena is NULL
+    }
     *wins = 0;
     *losses = 0;
     *draws = 0;
@@ -82,6 +106,9 @@ void play_games(Arena* arena, int num_games, int* wins, int* losses, int* draws)
 }
 
 void destroy_arena(Arena* arena) {
+    if (arena == NULL) {
+        return; // Exit early if arena is NULL
+    }
     free(arena->board); // Free board memory
     free(arena->board_size); // Free board size memory
     free(arena); // Free arena memory
