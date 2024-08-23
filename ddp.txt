@@ -169,13 +169,6 @@ I have already written most of the code, I just need your help to review the cod
 
 Here are some suggestions for improvement:
 
-Optimize gat_train_distributed:
-
-Implement more efficient data distribution across GPUs.
-Use NCCL for gradient aggregation after each backward pass.
-Implement model parallelism in addition to data parallelism for larger models.
-
-
 Enhance gat_broadcast_weights:
 
 Implement a more efficient weight synchronization mechanism using NCCL.

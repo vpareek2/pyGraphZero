@@ -405,15 +405,21 @@ static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pi
             int batch_start = batch * model->config.batch_size;
             int batch_size = min(model->config.batch_size, local_examples - batch_start);
 
-            // Forward pass with model parallelism
-            float *out_pi, *out_v;
+            // Allocate memory for layer inputs and outputs
+            float *layer_input, *layer_output, *out_pi, *out_v;
+            CUDA_CHECK(cudaMalloc(&layer_input, batch_size * model->config.hidden_features * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&layer_output, batch_size * model->config.hidden_features * sizeof(float)));
             CUDA_CHECK(cudaMalloc(&out_pi, batch_size * model->config.num_actions * sizeof(float)));
             CUDA_CHECK(cudaMalloc(&out_v, batch_size * sizeof(float)));
-            
-            float* layer_input = d_boards + batch_start * model->config.input_features;
-            float* layer_output;
-            CUDA_CHECK(cudaMalloc(&layer_output, batch_size * model->config.hidden_features * sizeof(float)));
 
+            // Copy input data to layer_input for the first GPU
+            if (world_rank == 0) {
+                CUDA_CHECK(cudaMemcpy(layer_input, d_boards + batch_start * model->config.input_features,
+                                      batch_size * model->config.input_features * sizeof(float),
+                                      cudaMemcpyDeviceToDevice));
+            }
+
+            // Forward pass with model parallelism
             for (int layer = start_layer; layer < end_layer; layer++) {
                 forward_gat_layer(model, layer, layer_input, layer_output, batch_size);
                 
@@ -421,14 +427,24 @@ static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pi
                 if (layer < model->config.num_layers - 1) {
                     int next_rank = (world_rank + 1) % world_size;
                     NCCL_CHECK(ncclSend(layer_output, batch_size * model->config.hidden_features, ncclFloat32, next_rank, nccl_comm, cuda_stream));
-                    NCCL_CHECK(ncclRecv(layer_input, batch_size * model->config.hidden_features, ncclFloat32, (world_rank - 1 + world_size) % world_size, nccl_comm, cuda_stream));
+                    if (layer < end_layer - 1) {
+                        NCCL_CHECK(ncclRecv(layer_input, batch_size * model->config.hidden_features, ncclFloat32, (world_rank - 1 + world_size) % world_size, nccl_comm, cuda_stream));
+                    }
                 }
+                // Swap layer_input and layer_output pointers
+                float* temp = layer_input;
+                layer_input = layer_output;
+                layer_output = temp;
             }
 
             // Final output layer
             if (world_rank == world_size - 1) {
-                compute_output(model, layer_output, out_pi, out_v, batch_size);
+                compute_output(model, layer_input, out_pi, out_v, batch_size);
             }
+
+            // Broadcast output to all GPUs
+            NCCL_CHECK(ncclBroadcast(out_pi, out_pi, batch_size * model->config.num_actions, ncclFloat32, world_size - 1, nccl_comm, cuda_stream));
+            NCCL_CHECK(ncclBroadcast(out_v, out_v, batch_size, ncclFloat32, world_size - 1, nccl_comm, cuda_stream));
 
             // Compute losses
             auto [pi_loss, v_loss] = compute_losses(d_pis + batch_start * model->config.num_actions, 
@@ -439,18 +455,43 @@ static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pi
             v_loss_sum += v_loss;
 
             // Backward pass with model parallelism
-            float* grad_input;
-            CUDA_CHECK(cudaMalloc(&grad_input, batch_size * model->config.hidden_features * sizeof(float)));
+            float* grad_output;
+            CUDA_CHECK(cudaMalloc(&grad_output, batch_size * model->config.hidden_features * sizeof(float)));
+
+            // Initialize grad_output for the last layer
+            if (world_rank == world_size - 1) {
+                // Compute gradients for policy and value heads
+                float *d_policy, *d_value;
+                CUDA_CHECK(cudaMalloc(&d_policy, batch_size * model->config.num_actions * sizeof(float)));
+                CUDA_CHECK(cudaMalloc(&d_value, batch_size * sizeof(float)));
+
+                softmax_cross_entropy_gradient<<<(model->config.num_actions + 255) / 256, 256>>>(
+                    out_pi, d_pis + batch_start * model->config.num_actions, d_policy, batch_size, model->config.num_actions);
+                mse_gradient<<<(batch_size + 255) / 256, 256>>>(
+                    out_v, d_vs + batch_start, d_value, batch_size);
+
+                // Compute initial grad_output
+                compute_initial_grad_output(model, d_policy, d_value, grad_output, batch_size);
+
+                CUDA_CHECK(cudaFree(d_policy));
+                CUDA_CHECK(cudaFree(d_value));
+            }
 
             for (int layer = end_layer - 1; layer >= start_layer; layer--) {
-                backward_gat_layer(model, layer, layer_input, layer_output, grad_input, batch_size);
+                backward_gat_layer(model, layer, layer_input, layer_output, grad_output, batch_size);
 
                 // Communicate gradients to previous GPU
                 if (layer > 0) {
                     int prev_rank = (world_rank - 1 + world_size) % world_size;
-                    NCCL_CHECK(ncclSend(grad_input, batch_size * model->config.hidden_features, ncclFloat32, prev_rank, nccl_comm, cuda_stream));
-                    NCCL_CHECK(ncclRecv(grad_input, batch_size * model->config.hidden_features, ncclFloat32, (world_rank + 1) % world_size, nccl_comm, cuda_stream));
+                    NCCL_CHECK(ncclSend(grad_output, batch_size * model->config.hidden_features, ncclFloat32, prev_rank, nccl_comm, cuda_stream));
+                    if (layer > start_layer) {
+                        NCCL_CHECK(ncclRecv(grad_output, batch_size * model->config.hidden_features, ncclFloat32, (world_rank + 1) % world_size, nccl_comm, cuda_stream));
+                    }
                 }
+                // Swap layer_input and layer_output pointers
+                float* temp = layer_input;
+                layer_input = layer_output;
+                layer_output = temp;
             }
 
             // Aggregate gradients across GPUs
@@ -477,10 +518,11 @@ static void gat_train_distributed(INeuralNet* self, float* d_boards, float* d_pi
             model->optimizer->zero_grad();
 
             // Clean up
+            CUDA_CHECK(cudaFree(layer_input));
+            CUDA_CHECK(cudaFree(layer_output));
             CUDA_CHECK(cudaFree(out_pi));
             CUDA_CHECK(cudaFree(out_v));
-            CUDA_CHECK(cudaFree(layer_output));
-            CUDA_CHECK(cudaFree(grad_input));
+            CUDA_CHECK(cudaFree(grad_output));
         }
 
         // Synchronize CUDA stream
@@ -696,198 +738,119 @@ __global__ void prepare_batch_kernel(TrainingExample* examples, int num_examples
     }
 }
 
-// Helper function for forward pass
-static void forward_gat(GATModel* model, float* batch_boards, float** out_pi, float** out_v) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-
+// Forward pass for a single GAT layer
+static void forward_gat_layer(GATModel* model, int layer_index, float* layer_input, float* layer_output, int batch_size) {
     cudnnHandle_t cudnn = model->cudnn_handle;
     cublasHandle_t cublas;
     CUDA_CHECK(cublasCreate(&cublas));
 
     float alpha = 1.0f, beta = 0.0f;
-    
-    // Input layer
-    CUDA_CHECK(cudnnConvolutionForward(cudnn, &alpha, model->input_descriptor, batch_boards,
-                            model->input_filter, model->input_weights,
-                            model->conv_descriptor, CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
-                            model->workspace, model->workspace_size, &beta, model->layer_descriptors[0], model->layer_outputs[0]));
 
-    // GAT layers
-    for (int i = 0; i < model->config.num_layers; i++) {
-        // Attention mechanism (custom CUDA kernel)
-        dim3 grid((model->config.max_nodes + 255) / 256, model->config.num_heads);
-        dim3 block(256);
-        compute_attention<<<grid, block>>>(model->layer_outputs[i], model->attention_weights[i], 
-                                           model->attention_scores[i], model->config.max_nodes, 
-                                           model->config.hidden_features, model->config.num_heads);
-        CUDA_CHECK(cudaGetLastError());
+    // Attention mechanism (custom CUDA kernel)
+    dim3 grid((model->config.max_nodes + 255) / 256, model->config.num_heads);
+    dim3 block(256);
+    compute_attention<<<grid, block>>>(layer_input, model->attention_weights[layer_index], 
+                                       model->attention_scores[layer_index], model->config.max_nodes, 
+                                       model->config.hidden_features, model->config.num_heads);
+    CUDA_CHECK(cudaGetLastError());
 
-        // Apply attention (custom CUDA kernel)
-        apply_attention<<<grid, block>>>(model->layer_outputs[i], model->attention_scores[i], 
-                                         model->layer_outputs[i+1], model->config.max_nodes, 
-                                         model->config.hidden_features, model->config.num_heads);
-        CUDA_CHECK(cudaGetLastError());
+    // Apply attention (custom CUDA kernel)
+    apply_attention<<<grid, block>>>(layer_input, model->attention_scores[layer_index], 
+                                     layer_output, model->config.max_nodes, 
+                                     model->config.hidden_features, model->config.num_heads);
+    CUDA_CHECK(cudaGetLastError());
 
-        // Linear transformation
-        CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    model->config.hidden_features, model->config.max_nodes, model->config.hidden_features,
-                    &alpha, model->layer_weights[i], model->config.hidden_features,
-                    model->layer_outputs[i+1], model->config.hidden_features,
-                    &beta, model->layer_outputs[i+1], model->config.hidden_features));
+    // Linear transformation
+    CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                model->config.hidden_features, model->config.max_nodes, model->config.hidden_features,
+                &alpha, model->layer_weights[layer_index], model->config.hidden_features,
+                layer_output, model->config.hidden_features,
+                &beta, layer_output, model->config.hidden_features));
 
-        // Add bias and apply activation (custom CUDA kernel)
-        add_bias_activate<<<grid, block>>>(model->layer_outputs[i+1], model->layer_biases[i], 
-                                           model->config.max_nodes, model->config.hidden_features);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    // Add bias and apply activation (custom CUDA kernel)
+    add_bias_activate<<<grid, block>>>(layer_output, model->layer_biases[layer_index], 
+                                       model->config.max_nodes, model->config.hidden_features);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cublasDestroy(cublas));
+}
+
+// Backward pass for a single GAT layer
+static void backward_gat_layer(GATModel* model, int layer_index, float* layer_input, float* layer_output, float* grad_output, int batch_size) {
+    cublasHandle_t cublas;
+    CUDA_CHECK(cublasCreate(&cublas));
+
+    float alpha = 1.0f, beta = 0.0f;
+
+    // Backpropagate through attention mechanism
+    backward_attention<<<(model->config.max_nodes + 255) / 256, 256>>>(
+        layer_input, model->attention_scores[layer_index], grad_output,
+        model->d_attention_weights[layer_index], model->d_layer_outputs[layer_index],
+        model->config.max_nodes, model->config.hidden_features, model->config.num_heads);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Backpropagate through linear transformation
+    CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                model->config.hidden_features, model->config.hidden_features, model->config.max_nodes,
+                &alpha, model->d_layer_outputs[layer_index], model->config.hidden_features,
+                model->layer_weights[layer_index], model->config.hidden_features,
+                &beta, grad_output, model->config.hidden_features));
+
+    CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                model->config.hidden_features, model->config.max_nodes, model->config.hidden_features,
+                &alpha, model->layer_weights[layer_index], model->config.hidden_features,
+                model->d_layer_outputs[layer_index], model->config.hidden_features,
+                &beta, model->d_layer_weights[layer_index], model->config.hidden_features));
+
+    // Compute gradient for biases
+    CUDA_CHECK(cublasSgemv(cublas, CUBLAS_OP_N,
+                model->config.hidden_features, model->config.max_nodes,
+                &alpha, model->d_layer_outputs[layer_index], model->config.hidden_features,
+                model->ones, 1,
+                &beta, model->d_layer_biases[layer_index], 1));
+
+    // Backpropagate activation function
+    backward_activation<<<(model->config.max_nodes * model->config.hidden_features + 255) / 256, 256>>>(
+        layer_output, grad_output,
+        model->config.max_nodes * model->config.hidden_features);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cublasDestroy(cublas));
+}
+
+// Compute final output (policy and value)
+static void compute_output(GATModel* model, float* last_layer_output, float* out_pi, float* out_v, int batch_size) {
+    cublasHandle_t cublas;
+    CUDA_CHECK(cublasCreate(&cublas));
+
+    float alpha = 1.0f, beta = 0.0f;
 
     // Output layer
     CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                model->config.num_actions, model->config.batch_size, model->config.hidden_features,
+                model->config.num_actions, batch_size, model->config.hidden_features,
                 &alpha, model->policy_weights, model->config.num_actions,
-                model->layer_outputs[model->config.num_layers], model->config.hidden_features,
-                &beta, *out_pi, model->config.num_actions));
+                last_layer_output, model->config.hidden_features,
+                &beta, out_pi, model->config.num_actions));
 
     CUDA_CHECK(cublasSgemv(cublas, CUBLAS_OP_N,
                 1, model->config.hidden_features,
                 &alpha, model->value_weights, 1,
-                model->layer_outputs[model->config.num_layers], 1,
-                &beta, *out_v, 1));
+                last_layer_output, 1,
+                &beta, out_v, 1));
 
     // Apply softmax to policy output (custom CUDA kernel)
-    dim3 grid_policy((model->config.num_actions + 255) / 256, model->config.batch_size);
+    dim3 grid_policy((model->config.num_actions + 255) / 256, batch_size);
     dim3 block_policy(256);
-    softmax<<<grid_policy, block_policy>>>(*out_pi, model->config.num_actions);
+    softmax<<<grid_policy, block_policy>>>(out_pi, model->config.num_actions);
     CUDA_CHECK(cudaGetLastError());
 
     // Apply tanh to value output (custom CUDA kernel)
-    dim3 grid_value((model->config.batch_size + 255) / 256);
+    dim3 grid_value((batch_size + 255) / 256);
     dim3 block_value(256);
-    tanh_activate<<<grid_value, block_value>>>(*out_v, model->config.batch_size);
+    tanh_activate<<<grid_value, block_value>>>(out_v, batch_size);
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cublasDestroy(cublas));
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-    printf("Forward pass took %lld microseconds\n", duration.count());
-}
-
-// Helper function to compute losses
-static std::pair<float, float> compute_losses(float* target_pi, float* target_v, float* out_pi, float* out_v, int batch_size, int action_size) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    // Use PyTorch for loss computation
-    auto target_pi_tensor = torch::from_blob(target_pi, {batch_size, action_size}, torch::kFloat32);
-    auto target_v_tensor = torch::from_blob(target_v, {batch_size}, torch::kFloat32);
-    auto out_pi_tensor = torch::from_blob(out_pi, {batch_size, action_size}, torch::kFloat32);
-    auto out_v_tensor = torch::from_blob(out_v, {batch_size}, torch::kFloat32);
-
-    auto pi_loss = torch::nn::functional::kl_div(out_pi_tensor.log(), target_pi_tensor, torch::Reduction::Sum);
-    auto v_loss = torch::mse_loss(out_v_tensor, target_v_tensor, torch::Reduction::Sum);
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-    printf("Loss computation took %lld microseconds\n", duration.count());
-
-    return {pi_loss.item<float>() / batch_size, v_loss.item<float>() / batch_size};
-}
-
-static void backward_gat(GATModel* model, float* batch_boards, float* target_pi, float* target_v, float* out_pi, float* out_v) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    cudnnHandle_t cudnn = model->cudnn_handle;
-    cublasHandle_t cublas;
-    CUDA_CHECK(cublasCreate(&cublas));
-
-    float alpha = 1.0f, beta = 0.0f;
-
-    // Compute gradients for policy and value heads
-    float* d_policy, *d_value;
-    CUDA_CHECK(cudaMalloc(&d_policy, model->config.batch_size * model->config.num_actions * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_value, model->config.batch_size * sizeof(float)));
-
-    // Policy loss gradient
-    softmax_cross_entropy_gradient<<<(model->config.num_actions + 255) / 256, 256>>>(
-        out_pi, target_pi, d_policy, model->config.batch_size, model->config.num_actions);
-    CUDA_CHECK(cudaGetLastError());
-
-    // Value loss gradient
-    mse_gradient<<<(model->config.batch_size + 255) / 256, 256>>>(
-        out_v, target_v, d_value, model->config.batch_size);
-    CUDA_CHECK(cudaGetLastError());
-
-    // Backpropagate through output layer
-    CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                model->config.hidden_features, model->config.batch_size, model->config.num_actions,
-                &alpha, model->policy_weights, model->config.num_actions,
-                d_policy, model->config.num_actions,
-                &beta, model->d_last_layer, model->config.hidden_features));
-
-    CUDA_CHECK(cublasSger(cublas, model->config.hidden_features, model->config.batch_size,
-               &alpha, model->value_weights, 1,
-               d_value, 1,
-               model->d_last_layer, model->config.hidden_features));
-
-    // Backpropagate through GAT layers
-    for (int i = model->config.num_layers - 1; i >= 0; i--) {
-        // Backpropagate through attention mechanism
-        backward_attention<<<(model->config.max_nodes + 255) / 256, 256>>>(
-            model->layer_outputs[i], model->attention_scores[i], model->d_last_layer,
-            model->d_attention_weights[i], model->d_layer_outputs[i],
-            model->config.max_nodes, model->config.hidden_features, model->config.num_heads);
-        CUDA_CHECK(cudaGetLastError());
-
-        // Backpropagate through linear transformation
-        CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
-                    model->config.hidden_features, model->config.hidden_features, model->config.max_nodes,
-                    &alpha, model->d_layer_outputs[i], model->config.hidden_features,
-                    model->layer_weights[i], model->config.hidden_features,
-                    &beta, model->d_last_layer, model->config.hidden_features));
-
-        CUDA_CHECK(cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    model->config.hidden_features, model->config.max_nodes, model->config.hidden_features,
-                    &alpha, model->layer_weights[i], model->config.hidden_features,
-                    model->d_layer_outputs[i], model->config.hidden_features,
-                    &beta, model->d_layer_weights[i], model->config.hidden_features));
-
-        // Compute gradient for biases
-        CUDA_CHECK(cublasSgemv(cublas, CUBLAS_OP_N,
-                    model->config.hidden_features, model->config.max_nodes,
-                    &alpha, model->d_layer_outputs[i], model->config.hidden_features,
-                    model->ones, 1,
-                    &beta, model->d_layer_biases[i], 1));
-
-        // Backpropagate activation function
-        backward_activation<<<(model->config.max_nodes * model->config.hidden_features + 255) / 256, 256>>>(
-            model->layer_outputs[i], model->d_last_layer,
-            model->config.max_nodes * model->config.hidden_features);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // Backpropagate through input layer
-    CUDA_CHECK(cudnnConvolutionBackwardFilter(cudnn, &alpha,
-                                   model->input_descriptor, batch_boards,
-                                   model->layer_descriptors[0], model->d_last_layer,
-                                   model->conv_descriptor, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0,
-                                   model->workspace, model->workspace_size,
-                                   &beta, model->input_filter, model->d_input_weights));
-
-    CUDA_CHECK(cudnnConvolutionBackwardData(cudnn, &alpha,
-                                 model->input_filter, model->input_weights,
-                                 model->layer_descriptors[0], model->d_last_layer,
-                                 model->conv_descriptor, CUDNN_CONVOLUTION_BWD_DATA_ALGO_0,
-                                 model->workspace, model->workspace_size,
-                                 &beta, model->input_descriptor, model->d_input_data));
-
-    // Clean up
-    CUDA_CHECK(cudaFree(d_policy));
-    CUDA_CHECK(cudaFree(d_value));
-    CUDA_CHECK(cublasDestroy(cublas));
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-    printf("Backward pass took %lld microseconds\n", duration.count());
 }
 
 // Custom CUDA kernel implementations
