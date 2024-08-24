@@ -74,19 +74,3 @@ class Board:
 
     def __str__(self):
         return str(self.np_pieces)
-
-# Example usage
-if __name__ == "__main__":
-    board = Board()
-    print("Initial board:")
-    print(board)
-
-    # Make some moves
-    moves = [(3, 1), (3, -1), (4, 1), (4, -1), (5, 1)]
-    for column, player in moves:
-        board.add_stone(column, player)
-        print(f"\nAfter move by player {player} in column {column}:")
-        print(board)
-
-    print("\nValid moves:", board.get_valid_moves())
-    print("Win state:", board.get_win_state())
