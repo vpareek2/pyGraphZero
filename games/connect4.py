@@ -1,5 +1,5 @@
 import numpy as np
-from game_utils.connect4_utils import Board, DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_WIN_LENGTH
+from games.game_utils.connect4_utils import Board, DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_WIN_LENGTH
 
 class Connect4Game:
     def __init__(self, height=DEFAULT_HEIGHT, width=DEFAULT_WIDTH, win_length=DEFAULT_WIN_LENGTH):
@@ -28,20 +28,24 @@ class Connect4Game:
         return Board(self.height, self.width, self.win_length, np_pieces=board).get_valid_moves()
 
     def get_game_ended(self, board, player):
+        print(f"Current board state:\n{board}")  # Debug print
         b = Board(self.height, self.width, self.win_length, np_pieces=board)
         winstate = b.get_win_state()
+        print(f"Winstate: {winstate}")  # Debug print
         if winstate.is_ended:
             if winstate.winner is None:
-                # draw has very little value.
+                print("Draw detected")  # Debug print
                 return 1e-4
             elif winstate.winner == player:
+                print(f"Player {player} won")  # Debug print
                 return +1
             elif winstate.winner == -player:
+                print(f"Player {-player} won")  # Debug print
                 return -1
             else:
                 raise ValueError('Unexpected winstate found: ', winstate)
         else:
-            # 0 used to represent unfinished game.
+            print("Game not ended")  # Debug print
             return 0
 
     def get_canonical_form(self, board, player):
@@ -53,7 +57,7 @@ class Connect4Game:
         return [(board, pi), (board[:, ::-1], pi[::-1])]
 
     def string_representation(self, board):
-        return board.tostring()
+        return board.tobytes()
 
     @staticmethod
     def display(board):

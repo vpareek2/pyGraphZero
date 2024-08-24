@@ -15,7 +15,7 @@ class Board:
         self.win_length = win_length
 
         if np_pieces is None:
-            self.np_pieces = np.zeros([self.height, self.width], dtype=np.int)
+            self.np_pieces = np.zeros([self.height, self.width], dtype=np.int32)
         else:
             self.np_pieces = np_pieces
             assert self.np_pieces.shape == (self.height, self.width)
@@ -33,20 +33,32 @@ class Board:
         return self.np_pieces[0] == 0
 
     def get_win_state(self):
+        print(f"Board state in get_win_state:\n{self.np_pieces}")  # Debug print
+        # Check for wins
         for player in [-1, 1]:
-            player_pieces = self.np_pieces == -player
-            # Check rows & columns for win
+            player_pieces = self.np_pieces == player
             if (self._is_straight_winner(player_pieces) or
                 self._is_straight_winner(player_pieces.transpose()) or
                 self._is_diagonal_winner(player_pieces)):
-                return WinState(True, -player)
+                print(f"Win detected for player {player}")  # Debug print
+                return WinState(True, player)
 
-        # draw has very little value.
+        # Check for draw
         if not self.get_valid_moves().any():
+            print("Draw detected in get_win_state")  # Debug print
             return WinState(True, None)
 
         # Game is not ended yet.
+        print("Game not ended in get_win_state")  # Debug print
         return WinState(False, None)
+
+    def _is_straight_winner(self, player_pieces):
+        """Checks if player_pieces contains a vertical or horizontal win."""
+        run_lengths = [player_pieces[:, i:i + self.win_length].sum(axis=1)
+                       for i in range(len(player_pieces) - self.win_length + 2)]
+        max_run = max([x.max() for x in run_lengths])
+        print(f"Max run length: {max_run}")  # Debug print
+        return max_run >= self.win_length
 
     def _is_diagonal_winner(self, player_pieces):
         """Checks if player_pieces contains a diagonal win."""
@@ -59,12 +71,6 @@ class Board:
                 if all(player_pieces[i + x][j - x] for x in range(win_length)):
                     return True
         return False
-
-    def _is_straight_winner(self, player_pieces):
-        """Checks if player_pieces contains a vertical or horizontal win."""
-        run_lengths = [player_pieces[:, i:i + self.win_length].sum(axis=1)
-                       for i in range(len(player_pieces) - self.win_length + 2)]
-        return max([x.max() for x in run_lengths]) >= self.win_length
 
     def __str__(self):
         return str(self.np_pieces)
