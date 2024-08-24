@@ -1,5 +1,5 @@
 import numpy as np
-from game_utils.tictactoe_utils import Board
+from games.game_utils.tictactoe_utils import Board
 
 class TicTacToeGame:
     def __init__(self, n=3):
@@ -67,7 +67,7 @@ class TicTacToeGame:
         return l
 
     def string_representation(self, board):
-        return board.tostring()
+        return board.tobytes()
 
     @staticmethod
     def display(board):
