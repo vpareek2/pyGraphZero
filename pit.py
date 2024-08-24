@@ -1,11 +1,10 @@
+import numpy as np
+
 import arena
 from mcts import MCTS
 from games.tictactoe import TicTacToeGame
 from games.game_utils.tictactoe_utils import *
 from networks.tictactoe_resnet import NNetWrapper as NNet
-
-
-import numpy as np
 from utils import *
 
 """
