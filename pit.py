@@ -1,8 +1,8 @@
-import Arena
-from MCTS import MCTS
-from games.tictactoe.tictactoe_game import TicTacToeGame
-from games.tictactoe.tictactoe_players import *
-from games.tictactoe.nnet import NNetWrapper as NNet
+import arena
+from mcts import MCTS
+from games.tictactoe import TicTacToeGame
+from games.game_utils.tictactoe_utils import *
+from networks.tictactoe_resnet import NNetWrapper as NNet
 
 
 import numpy as np
@@ -23,10 +23,7 @@ else:
 
 # all players
 rp = RandomPlayer(g).play
-gp = GreedyTicTacToePlayer(g).play
 hp = HumanTicTacToePlayer(g).play
-
-
 
 # nnet players
 n1 = NNet(g)
@@ -49,6 +46,6 @@ else:
 
     player2 = n2p  # Player 2 is neural network if it's cpu vs cpu.
 
-arena = Arena.Arena(n1p, player2, g, display=TicTacToeGame.display)
+arena = arena.Arena(n1p, player2, g, display=TicTacToeGame.display)
 
 print(arena.playGames(2, verbose=True))

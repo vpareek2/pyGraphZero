@@ -1,136 +1,98 @@
-import logging
-import math
+import torch
 
-import numpy as np
-
-EPS = 1e-8
-
-log = logging.getLogger(__name__)
-
-
-class MCTS():
-    """
-    This class handles the MCTS tree.
-    """
-
+class MCTS:
     def __init__(self, game, nnet, args):
         self.game = game
         self.nnet = nnet
         self.args = args
-        self.Qsa = {}  # stores Q values for s,a (as defined in the paper)
-        self.Nsa = {}  # stores #times edge s,a was visited
-        self.Ns = {}  # stores #times board s was visited
-        self.Ps = {}  # stores initial policy (returned by neural net)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.Es = {}  # stores game.getGameEnded ended for board s
-        self.Vs = {}  # stores game.getValidMoves for board s
+        # Initialize tensors for parallel environments
+        self.num_envs = args.num_parallel_envs
+        self.action_size = game.get_action_size()
 
-    def getActionProb(self, canonicalBoard, temp=1):
-        """
-        This function performs numMCTSSims simulations of MCTS starting from
-        canonicalBoard.
+        # Tree structure
+        self.max_nodes = args.max_nodes
+        self.Qsa = torch.zeros((self.num_envs, self.max_nodes, self.action_size), device=self.device)
+        self.Nsa = torch.zeros((self.num_envs, self.max_nodes, self.action_size), dtype=torch.long, device=self.device)
+        self.Ns = torch.zeros((self.num_envs, self.max_nodes), dtype=torch.long, device=self.device)
+        self.Ps = torch.zeros((self.num_envs, self.max_nodes, self.action_size), device=self.device)
+        
+        self.Es = torch.zeros((self.num_envs, self.max_nodes), device=self.device)
+        self.Vs = torch.zeros((self.num_envs, self.max_nodes, self.action_size), dtype=torch.bool, device=self.device)
 
-        Returns:
-            probs: a policy vector where the probability of the ith action is
-                   proportional to Nsa[(s,a)]**(1./temp)
-        """
-        for i in range(self.args.numMCTSSims):
-            self.search(canonicalBoard)
+        self.next_node = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
 
-        s = self.game.stringRepresentation(canonicalBoard)
-        counts = [self.Nsa[(s, a)] if (s, a) in self.Nsa else 0 for a in range(self.game.getActionSize())]
+    def get_action_prob(self, canonical_boards, temp=1):
+        for _ in range(self.args.num_mcts_sims):
+            self.search(canonical_boards)
+
+        s = 0  # Root node index
+        counts = self.Nsa[:, s, :]
 
         if temp == 0:
-            bestAs = np.array(np.argwhere(counts == np.max(counts))).flatten()
-            bestA = np.random.choice(bestAs)
-            probs = [0] * len(counts)
-            probs[bestA] = 1
-            return probs
+            best_actions = counts.argmax(dim=1)
+            probs = torch.zeros_like(counts)
+            probs.scatter_(1, best_actions.unsqueeze(1), 1)
+        else:
+            counts = counts.float() ** (1. / temp)
+            probs = counts / counts.sum(dim=1, keepdim=True)
 
-        counts = [x ** (1. / temp) for x in counts]
-        counts_sum = float(sum(counts))
-        probs = [x / counts_sum for x in counts]
         return probs
 
-    def search(self, canonicalBoard):
-        """
-        This function performs one iteration of MCTS. It is recursively called
-        till a leaf node is found. The action chosen at each node is one that
-        has the maximum upper confidence bound as in the paper.
+    def search(self, canonical_boards):
+        env_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        s = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        
+        while env_mask.any():
+            ended = self.Es[torch.arange(self.num_envs), s] != 0
+            if ended.any():
+                env_mask[ended] = False
+                continue
 
-        Once a leaf node is found, the neural network is called to return an
-        initial policy P and a value v for the state. This value is propagated
-        up the search path. In case the leaf node is a terminal state, the
-        outcome is propagated up the search path. The values of Ns, Nsa, Qsa are
-        updated.
+            unvisited = self.Ns[torch.arange(self.num_envs), s] == 0
+            if unvisited.any():
+                unvisited_mask = env_mask & unvisited
+                self._expand(canonical_boards[unvisited_mask], s[unvisited_mask])
+                env_mask[unvisited_mask] = False
+                continue
 
-        NOTE: the return values are the negative of the value of the current
-        state. This is done since v is in [-1,1] and if v is the value of a
-        state for the current player, then its value is -v for the other player.
+            valid_moves = self.Vs[torch.arange(self.num_envs), s]
+            uct_scores = self._uct_scores(s)
+            uct_scores[~valid_moves] = float('-inf')
+            a = uct_scores.argmax(dim=1)
 
-        Returns:
-            v: the negative of the value of the current canonicalBoard
-        """
+            next_s, next_player = self.game.get_next_state(canonical_boards, 1, a)
+            canonical_boards = self.game.get_canonical_form(next_s, next_player)
+            
+            v = -self.search(canonical_boards)
+            
+            self._backpropagate(s, a, v)
+            s = self.next_node[torch.arange(self.num_envs)]
+            self.next_node += 1
 
-        s = self.game.stringRepresentation(canonicalBoard)
+        return -self.Es[torch.arange(self.num_envs), s]
 
-        if s not in self.Es:
-            self.Es[s] = self.game.getGameEnded(canonicalBoard, 1)
-        if self.Es[s] != 0:
-            # terminal node
-            return -self.Es[s]
-
-        if s not in self.Ps:
-            # leaf node
-            self.Ps[s], v = self.nnet.predict(canonicalBoard)
-            valids = self.game.getValidMoves(canonicalBoard, 1)
-            self.Ps[s] = self.Ps[s] * valids  # masking invalid moves
-            sum_Ps_s = np.sum(self.Ps[s])
-            if sum_Ps_s > 0:
-                self.Ps[s] /= sum_Ps_s  # renormalize
-            else:
-                # if all valid moves were masked make all valid moves equally probable
-
-                # NB! All valid moves may be masked if either your NNet architecture is insufficient or you've get overfitting or something else.
-                # If you have got dozens or hundreds of these messages you should pay attention to your NNet and/or training process.   
-                log.error("All valid moves were masked, doing a workaround.")
-                self.Ps[s] = self.Ps[s] + valids
-                self.Ps[s] /= np.sum(self.Ps[s])
-
-            self.Vs[s] = valids
-            self.Ns[s] = 0
-            return -v
-
-        valids = self.Vs[s]
-        cur_best = -float('inf')
-        best_act = -1
-
-        # pick the action with the highest upper confidence bound
-        for a in range(self.game.getActionSize()):
-            if valids[a]:
-                if (s, a) in self.Qsa:
-                    u = self.Qsa[(s, a)] + self.args.cpuct * self.Ps[s][a] * math.sqrt(self.Ns[s]) / (
-                            1 + self.Nsa[(s, a)])
-                else:
-                    u = self.args.cpuct * self.Ps[s][a] * math.sqrt(self.Ns[s] + EPS)  # Q = 0 ?
-
-                if u > cur_best:
-                    cur_best = u
-                    best_act = a
-
-        a = best_act
-        next_s, next_player = self.game.getNextState(canonicalBoard, 1, a)
-        next_s = self.game.getCanonicalForm(next_s, next_player)
-
-        v = self.search(next_s)
-
-        if (s, a) in self.Qsa:
-            self.Qsa[(s, a)] = (self.Nsa[(s, a)] * self.Qsa[(s, a)] + v) / (self.Nsa[(s, a)] + 1)
-            self.Nsa[(s, a)] += 1
-
-        else:
-            self.Qsa[(s, a)] = v
-            self.Nsa[(s, a)] = 1
-
-        self.Ns[s] += 1
+    def _expand(self, canonical_boards, s):
+        self.Ps[torch.arange(self.num_envs), s], v = self.nnet.predict(canonical_boards)
+        valids = self.game.get_valid_moves(canonical_boards, 1)
+        self.Ps[torch.arange(self.num_envs), s] *= valids
+        self.Ps[torch.arange(self.num_envs), s] /= self.Ps[torch.arange(self.num_envs), s].sum(dim=1, keepdim=True)
+        self.Vs[torch.arange(self.num_envs), s] = valids
+        self.Es[torch.arange(self.num_envs), s] = self.game.get_game_ended(canonical_boards, 1)
         return -v
+
+    def _uct_scores(self, s):
+        Ns_sqrt = torch.sqrt(self.Ns[torch.arange(self.num_envs), s].unsqueeze(1))
+        Qsa = self.Qsa[torch.arange(self.num_envs), s]
+        Psa = self.Ps[torch.arange(self.num_envs), s]
+        Nsa = self.Nsa[torch.arange(self.num_envs), s]
+        
+        uct = Qsa + self.args.cpuct * Psa * Ns_sqrt / (1 + Nsa)
+        return uct
+
+    def _backpropagate(self, s, a, v):
+        env_indices = torch.arange(self.num_envs)
+        self.Qsa[env_indices, s, a] = (self.Nsa[env_indices, s, a] * self.Qsa[env_indices, s, a] + v) / (self.Nsa[env_indices, s, a] + 1)
+        self.Nsa[env_indices, s, a] += 1
+        self.Ns[env_indices, s] += 1

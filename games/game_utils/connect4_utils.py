@@ -7,17 +7,12 @@ DEFAULT_WIN_LENGTH = 4
 
 WinState = namedtuple('WinState', 'is_ended winner')
 
-
-class Board():
-    """
-    Connect4 Board.
-    """
-
-    def __init__(self, height=None, width=None, win_length=None, np_pieces=None):
+class Board:
+    def __init__(self, height=DEFAULT_HEIGHT, width=DEFAULT_WIDTH, win_length=DEFAULT_WIN_LENGTH, np_pieces=None):
         "Set up initial board configuration."
-        self.height = height or DEFAULT_HEIGHT
-        self.width = width or DEFAULT_WIDTH
-        self.win_length = win_length or DEFAULT_WIN_LENGTH
+        self.height = height
+        self.width = width
+        self.win_length = win_length
 
         if np_pieces is None:
             self.np_pieces = np.zeros([self.height, self.width], dtype=np.int)
@@ -29,7 +24,7 @@ class Board():
         "Create copy of board containing new stone."
         available_idx, = np.where(self.np_pieces[:, column] == 0)
         if len(available_idx) == 0:
-            raise ValueError("Can't play column %s on board %s" % (column, self))
+            raise ValueError(f"Can't play column {column} on board {self}")
 
         self.np_pieces[available_idx[-1]][column] = player
 
@@ -53,12 +48,6 @@ class Board():
         # Game is not ended yet.
         return WinState(False, None)
 
-    def with_np_pieces(self, np_pieces):
-        """Create copy of board with specified pieces."""
-        if np_pieces is None:
-            np_pieces = self.np_pieces
-        return Board(self.height, self.width, self.win_length, np_pieces)
-
     def _is_diagonal_winner(self, player_pieces):
         """Checks if player_pieces contains a diagonal win."""
         win_length = self.win_length
@@ -79,3 +68,19 @@ class Board():
 
     def __str__(self):
         return str(self.np_pieces)
+
+# Example usage
+if __name__ == "__main__":
+    board = Board()
+    print("Initial board:")
+    print(board)
+
+    # Make some moves
+    moves = [(3, 1), (3, -1), (4, 1), (4, -1), (5, 1)]
+    for column, player in moves:
+        board.add_stone(column, player)
+        print(f"\nAfter move by player {player} in column {column}:")
+        print(board)
+
+    print("\nValid moves:", board.get_valid_moves())
+    print("Win state:", board.get_win_state())
