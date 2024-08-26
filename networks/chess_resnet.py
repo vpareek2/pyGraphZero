@@ -69,7 +69,7 @@ class ChessResNet(nn.Module):
 
         return F.log_softmax(pi, dim=1), v
 
-class ChessNNetWrapper:
+class NNetWrapper:
     def __init__(self, game, args):
         self.game = game
         self.args = args

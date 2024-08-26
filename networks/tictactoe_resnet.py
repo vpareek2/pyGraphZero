@@ -142,7 +142,7 @@ class TicTacToeResNet(nn.Module):
         self.load_state_dict(checkpoint['state_dict'])
 
 # Wrapper of Resnet, for simple interchangability with GAT
-class TicTacToeNNetWrapper:
+class NNetWrapper:
     def __init__(self, game, args):
         self.game = game
         self.args = args

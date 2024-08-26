@@ -221,7 +221,7 @@ class Connect4GAT(nn.Module):
         edge_index = torch.tensor(edges, dtype=torch.long).t()
         return edge_index
 
-class Connect4NNetWrapper:
+class NNetWrapper:
     def __init__(self, game, args):
         self.game = game
         self.args = args

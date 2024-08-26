@@ -212,7 +212,7 @@ class ChessGAT(nn.Module):
         edge_index = torch.tensor(edges, dtype=torch.long).t()
         return edge_index
 
-class ChessNNetWrapper:
+class NNetWrapper:
     def __init__(self, game, args):
         self.game = game
         self.args = args
