@@ -1,121 +1,112 @@
-import chess
 import numpy as np
+import chess
 
 class ChessGame:
     def __init__(self):
         self.board = chess.Board()
 
     def get_init_board(self):
-        self.board.reset()
         return self.board_to_numpy()
 
     def get_board_size(self):
-        return (8, 8)  # Standard chess board size
+        return (8, 8)
 
     def get_action_size(self):
-        return 8 * 8 * 73  # All possible moves: 64 squares * 73 possible moves from any square
+        return 8 * 8 * 73  # 64 squares, 73 possible moves per square (including promotions)
 
-    def get_next_state(self, board, player, action):
-        """
-        Input:
-            board: current board (numpy array)
-            player: current player (1 for white, -1 for black)
-            action: action taken by current player
-
-        Returns:
-            next_board: board after applying action
-            next_player: player who plays in the next turn
-        """
-        self.board = self.numpy_to_board(board)
-        move = self.action_to_move(action)
-        self.board.push(move)
-        return self.board_to_numpy(), -player
+    def action_to_move(self, action):
+        from_square = action // 73
+        to_square = (action % 73) % 64
+        promotion = (action % 73) // 64 + 1 if action % 73 >= 64 else None
+        
+        # Debug print statements
+        print(f"Action: {action}")
+        print(f"From square: {from_square}")
+        print(f"To square: {to_square}")
+        print(f"Promotion: {promotion}")
+        
+        # Check if squares are valid
+        if from_square < 0 or from_square > 63 or to_square < 0 or to_square > 63:
+            print("Invalid squares detected")
+            return None
+        
+        return chess.Move(from_square, to_square, promotion)
 
     def get_valid_moves(self, board, player):
-        self.board = self.numpy_to_board(board)
-        valid_moves = [0] * self.get_action_size()
-        for move in self.board.legal_moves:
+        chess_board = self.numpy_to_board(board)
+        valid_moves = np.zeros(self.get_action_size(), dtype=np.int8)
+        for move in chess_board.legal_moves:
             valid_moves[self.move_to_action(move)] = 1
-        return np.array(valid_moves)
+        return valid_moves
 
     def get_game_ended(self, board, player):
-        self.board = self.numpy_to_board(board)
-        if self.board.is_game_over():
-            if self.board.is_checkmate():
-                return 1 if self.board.turn == chess.BLACK else -1
-            else:  # draw
-                return 1e-4
+        chess_board = self.numpy_to_board(board)
+        if chess_board.is_game_over():
+            if chess_board.is_checkmate():
+                return -player
+            elif chess_board.is_stalemate() or chess_board.is_insufficient_material() or chess_board.is_seventyfive_moves() or chess_board.is_fivefold_repetition():
+                return 1e-4  # draw has a very little value
         return 0
 
     def get_canonical_form(self, board, player):
-        # In chess, the board is always from the perspective of the current player
-        return board if player == 1 else np.flip(board, axis=0)
+        return board * player
 
     def get_symmetries(self, board, pi):
-        # Chess doesn't have symmetries like Connect4
+        # Chess has no symmetries
         return [(board, pi)]
 
     def string_representation(self, board):
-        self.board = self.numpy_to_board(board)
-        return self.board.fen()
+        return self.numpy_to_board(board).fen()
 
-    @staticmethod
-    def display(board):
-        print(chess.Board(ChessGame.numpy_to_board(board).fen()))
-
-    def board_to_numpy(self):
-        # Convert chess.Board to a numpy array
-        board_matrix = np.zeros((8, 8, 12), dtype=np.int8)
-        for i in range(64):
-            piece = self.board.piece_at(i)
+    def board_to_numpy(self, board=None):
+        if board is None:
+            board = self.board
+        numpy_board = np.zeros((8, 8, 12), dtype=np.int8)
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
             if piece:
                 color = int(piece.color)
                 piece_type = piece.piece_type - 1
-                board_matrix[i // 8, i % 8, piece_type + 6 * color] = 1
-        return board_matrix
+                numpy_board[square // 8, square % 8, piece_type + 6 * color] = 1
+        return numpy_board
 
-    @staticmethod
-    def numpy_to_board(board_matrix):
-        # Convert numpy array to chess.Board
+    def numpy_to_board(self, numpy_board):
         board = chess.Board(None)
-        for i in range(8):
-            for j in range(8):
-                piece = np.argmax(board_matrix[i, j])
-                if piece != 0:
-                    color = chess.WHITE if piece > 5 else chess.BLACK
-                    piece_type = (piece % 6) + 1
-                    board.set_piece_at(8 * i + j, chess.Piece(piece_type, color))
+        for square in chess.SQUARES:
+            piece_index = np.argmax(numpy_board[square // 8, square % 8])
+            if piece_index < 12:
+                color = chess.WHITE if piece_index < 6 else chess.BLACK
+                piece_type = (piece_index % 6) + 1
+                board.set_piece_at(square, chess.Piece(piece_type, color))
         return board
 
-    def action_to_move(self, action):
-        # Convert action index to chess move
-        from_square = action // 73
-        to_square = (action % 73) // 8
-        promotion = (action % 73) % 8
-        return chess.Move(from_square, to_square, promotion)
-
     def move_to_action(self, move):
-        # Convert chess move to action index
         from_square = move.from_square
         to_square = move.to_square
-        promotion = move.promotion if move.promotion else 0
-        return 73 * from_square + 8 * to_square + promotion
+        promotion = move.promotion
+        action = from_square * 73 + to_square
+        if promotion:
+            action += (promotion - 1) * 64 + 64
+        return action
 
-# Example usage
-if __name__ == "__main__":
-    game = ChessGame()
-    board = game.get_init_board()
-    player = 1
-    
-    print("Initial board:")
-    game.display(board)
-    
-    # Make some moves
-    for _ in range(5):
-        valid_moves = game.get_valid_moves(board, player)
-        action = np.random.choice(len(valid_moves), p=valid_moves/sum(valid_moves))
-        board, player = game.get_next_state(board, player, action)
-        print(f"\nAfter move:")
-        game.display(board)
-    
-    print("\nGame ended:", game.get_game_ended(board, player))
+    def action_to_move(self, action):
+            from_square = action // 73
+            to_square = (action % 73) % 64
+            promotion = (action % 73) // 64 + 1 if action % 73 >= 64 else None
+            
+            # Debug print statements
+            print(f"Action: {action}")
+            print(f"From square: {from_square}")
+            print(f"To square: {to_square}")
+            print(f"Promotion: {promotion}")
+            
+            # Check if squares are valid
+            if from_square < 0 or from_square > 63 or to_square < 0 or to_square > 63:
+                print("Invalid squares detected")
+                return None
+            
+            return chess.Move(from_square, to_square, promotion)
+
+    @staticmethod
+    def display(board):
+        print(chess.Board(ChessGame().string_representation(board)))
