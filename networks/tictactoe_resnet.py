@@ -1,3 +1,19 @@
+"""
+This file contains the implementation of the Residual Network built for TicTacToe, per the original AlphaZero architecture. The file contains 3 classes
+
+    Class: ResBlock
+        def __init__(nn.Module)
+        def forward(self, x)
+
+    Class: TicTacToe Resnet
+        def __init__(nn.Module)
+        def forward(self, s)
+        def train_step(self, examples)
+        def loss_pi(self, targets, outputs)
+"""
+
+
+
 import os
 import time
 import numpy as np
@@ -8,6 +24,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Residual Block Class
 class ResBlock(nn.Module):
     def __init__(self, num_channels):
         super(ResBlock, self).__init__()
@@ -24,6 +41,7 @@ class ResBlock(nn.Module):
         out = F.relu(out)
         return out
 
+# Residual Network Class (Tailored to TicTacToe)
 class TicTacToeResNet(nn.Module):
     def __init__(self, game, args):
         super(TicTacToeResNet, self).__init__()
@@ -123,6 +141,7 @@ class TicTacToeResNet(nn.Module):
         checkpoint = torch.load(filepath)
         self.load_state_dict(checkpoint['state_dict'])
 
+# Wrapper of Resnet, for simple interchangability with GAT
 class TicTacToeNNetWrapper:
     def __init__(self, game, args):
         self.game = game
