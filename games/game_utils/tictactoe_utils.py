@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 class Board:
     def __init__(self, n=3):
@@ -9,12 +10,22 @@ class Board:
         return self.pieces[index]
 
     def get_legal_moves(self):
-        moves = []
-        for y in range(self.n):
-            for x in range(self.n):
-                if self[x][y] == 0:
-                    moves.append((x, y))
-        return moves
+        if isinstance(self.board, np.ndarray):
+            # Single board
+            moves = []
+            for x in range(3):
+                for y in range(3):
+                    if self.board[x][y] == 0:
+                        moves.append((x, y))
+            return moves
+        elif isinstance(self.board, torch.Tensor):
+            # Batched boards
+            empty_spots = (self.board == 0)
+            legal_moves = torch.zeros_like(self.board, dtype=torch.bool)
+            legal_moves[empty_spots] = True
+            return legal_moves
+        else:
+            raise ValueError("Unsupported board type")
 
     def has_legal_moves(self):
         for y in range(self.n):

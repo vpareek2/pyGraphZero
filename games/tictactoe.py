@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from games.game_utils.tictactoe_utils import Board
 
 class TicTacToeGame:
@@ -25,16 +26,19 @@ class TicTacToeGame:
         return (b.pieces, -player)
 
     def get_valid_moves(self, board, player):
-        valids = [0] * self.get_action_size()
-        b = Board(self.n)
-        b.pieces = np.copy(board)
-        legal_moves = b.get_legal_moves()
-        if len(legal_moves) == 0:
-            valids[-1] = 1
+        if isinstance(board, np.ndarray):
+            # Single board
+            b = Board(board)
+            legal_moves = b.get_legal_moves()
+            valids = [1 if (i, j) in legal_moves else 0 for i in range(3) for j in range(3)]
             return np.array(valids)
-        for x, y in legal_moves:
-            valids[self.n * x + y] = 1
-        return np.array(valids)
+        elif isinstance(board, torch.Tensor):
+            # Batched boards
+            empty_spots = (board == 0)
+            legal_moves = empty_spots.view(board.shape[0], -1)
+            return legal_moves
+        else:
+            raise ValueError("Unsupported board type")
 
     def get_game_ended(self, board, player):
         b = Board(self.n)

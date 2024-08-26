@@ -212,12 +212,30 @@ class NNetWrapper:
 
     def predict(self, board):
         start = time.time()
-        board = torch.FloatTensor(board.astype(np.float64)).unsqueeze(0).to(self.device)
+        
+        # Check if the input is already a torch tensor
+        if not isinstance(board, torch.Tensor):
+            board = torch.FloatTensor(board)
+        else:
+            # If it's already a tensor, ensure it's a float tensor
+            board = board.float()
+        
+        # Ensure the input is 4D: [batch_size, channels, height, width]
+        if board.dim() == 3:
+            board = board.unsqueeze(1)  # Add channel dimension
+        elif board.dim() == 2:
+            board = board.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+        
+        board = board.to(self.device)
+        
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
+        
         print(f'PREDICTION TIME TAKEN: {time.time() - start:.3f}')
-        return torch.exp(pi).data.cpu().numpy()[0], v.data.cpu().numpy()[0]
+        
+        # Return PyTorch tensors instead of numpy arrays
+        return torch.exp(pi), v
 
     def loss_pi(self, targets, outputs):
         return -torch.sum(targets * outputs) / targets.size()[0]

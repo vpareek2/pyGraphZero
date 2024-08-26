@@ -74,13 +74,20 @@ class MCTS:
         return -self.Es[torch.arange(self.num_envs), s]
 
     def _expand(self, canonical_boards, s):
-        self.Ps[torch.arange(self.num_envs), s], v = self.nnet.predict(canonical_boards)
+        pi, v = self.nnet.predict(canonical_boards)
         valids = self.game.get_valid_moves(canonical_boards, 1)
-        self.Ps[torch.arange(self.num_envs), s] *= valids
-        self.Ps[torch.arange(self.num_envs), s] /= self.Ps[torch.arange(self.num_envs), s].sum(dim=1, keepdim=True)
-        self.Vs[torch.arange(self.num_envs), s] = valids
-        self.Es[torch.arange(self.num_envs), s] = self.game.get_game_ended(canonical_boards, 1)
-        return -v
+        
+        # Ensure pi and valids have the same shape
+        if pi.shape != valids.shape:
+            pi = pi.view(valids.shape)
+        
+        self.Ps[torch.arange(len(s)), s] = pi.to(self.device)
+        self.Ps[torch.arange(len(s)), s] *= valids.to(self.device)
+        sum_Ps_s = self.Ps[torch.arange(len(s)), s].sum(dim=1, keepdim=True)
+        self.Ps[torch.arange(len(s)), s] /= sum_Ps_s
+        self.Vs[torch.arange(len(s)), s] = valids.to(self.device)
+        self.Es[torch.arange(len(s)), s] = self.game.get_game_ended(canonical_boards, 1)
+        return -v.squeeze(-1)
 
     def _uct_scores(self, s):
         Ns_sqrt = torch.sqrt(self.Ns[torch.arange(self.num_envs), s].unsqueeze(1))
