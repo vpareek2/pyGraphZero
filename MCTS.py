@@ -27,8 +27,8 @@ class MCTS:
         for _ in range(self.args.num_mcts_sims):
             self.search(canonical_boards)
 
-        s = 0  # Root node index
-        counts = self.Nsa[:, s, :]
+        s = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        counts = self.Nsa[torch.arange(self.num_envs), s]
 
         if temp == 0:
             best_actions = counts.argmax(dim=1)
@@ -77,17 +77,13 @@ class MCTS:
         pi, v = self.nnet.predict(canonical_boards)
         valids = self.game.get_valid_moves(canonical_boards, 1)
         
-        # Ensure pi and valids have the same shape
-        if pi.shape != valids.shape:
-            pi = pi.view(valids.shape)
-        
         self.Ps[torch.arange(len(s)), s] = pi.to(self.device)
         self.Ps[torch.arange(len(s)), s] *= valids.to(self.device)
         sum_Ps_s = self.Ps[torch.arange(len(s)), s].sum(dim=1, keepdim=True)
         self.Ps[torch.arange(len(s)), s] /= sum_Ps_s
         self.Vs[torch.arange(len(s)), s] = valids.to(self.device)
         self.Es[torch.arange(len(s)), s] = self.game.get_game_ended(canonical_boards, 1)
-        return -v.squeeze(-1)
+        return -v
 
     def _uct_scores(self, s):
         Ns_sqrt = torch.sqrt(self.Ns[torch.arange(self.num_envs), s].unsqueeze(1))
