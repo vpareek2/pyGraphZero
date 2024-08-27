@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 class MCTS:
     def __init__(self, game, nnet, args):
@@ -77,12 +78,25 @@ class MCTS:
         pi, v = self.nnet.predict(canonical_boards)
         valids = self.game.get_valid_moves(canonical_boards, 1)
         
+        # Ensure pi and valids have the same shape as self.Ps
+        pi = pi.view(len(s), -1)
+        valids = valids.view(len(s), -1)
+        
+        # Ensure that pi and valids have the correct number of actions
+        if pi.shape[1] != self.action_size or valids.shape[1] != self.action_size:
+            pi = torch.nn.functional.pad(pi, (0, self.action_size - pi.shape[1]))
+            valids = torch.nn.functional.pad(valids, (0, self.action_size - valids.shape[1]))
+        
         self.Ps[torch.arange(len(s)), s] = pi.to(self.device)
         self.Ps[torch.arange(len(s)), s] *= valids.to(self.device)
         sum_Ps_s = self.Ps[torch.arange(len(s)), s].sum(dim=1, keepdim=True)
         self.Ps[torch.arange(len(s)), s] /= sum_Ps_s
         self.Vs[torch.arange(len(s)), s] = valids.to(self.device)
-        self.Es[torch.arange(len(s)), s] = self.game.get_game_ended(canonical_boards, 1)
+        game_ended = self.game.get_game_ended(canonical_boards, 1)
+        if isinstance(game_ended, torch.Tensor):
+            self.Es[torch.arange(len(s)), s] = game_ended
+        else:
+            self.Es[torch.arange(len(s)), s] = game_ended
         return -v
 
     def _uct_scores(self, s):

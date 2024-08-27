@@ -41,16 +41,30 @@ class TicTacToeGame:
             raise ValueError("Unsupported board type")
 
     def get_game_ended(self, board, player):
-        b = Board(self.n)
-        b.pieces = np.copy(board)
-
-        if b.is_win(player):
-            return 1
-        if b.is_win(-player):
-            return -1
-        if b.has_legal_moves():
-            return 0
-        return 1e-4  # draw has a very little value
+        if board.dim() == 3:  # Batch of boards
+            results = []
+            for single_board in board:
+                b = Board(single_board.shape[0])
+                b.pieces = single_board
+                if b.is_win(player):
+                    results.append(1)
+                elif b.is_win(-player):
+                    results.append(-1)
+                elif b.has_legal_moves():
+                    results.append(0)
+                else:
+                    results.append(1e-4)  # draw has a very little value
+            return torch.tensor(results, device=board.device)
+        else:  # Single board
+            b = Board(board.shape[0])
+            b.pieces = board
+            if b.is_win(player):
+                return 1
+            if b.is_win(-player):
+                return -1
+            if b.has_legal_moves():
+                return 0
+            return 1e-4  # draw has a very little value
 
     def get_canonical_form(self, board, player):
         return player * board

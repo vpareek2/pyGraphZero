@@ -4,54 +4,33 @@ import torch
 class Board:
     def __init__(self, n=3):
         self.n = n
-        self.pieces = [[0 for _ in range(n)] for _ in range(n)]
+        self.pieces = torch.zeros((n, n), dtype=torch.int)
 
     def __getitem__(self, index):
         return self.pieces[index]
 
     def get_legal_moves(self):
-        if isinstance(self.board, np.ndarray):
-            # Single board
-            moves = []
-            for x in range(3):
-                for y in range(3):
-                    if self.board[x][y] == 0:
-                        moves.append((x, y))
-            return moves
-        elif isinstance(self.board, torch.Tensor):
-            # Batched boards
-            empty_spots = (self.board == 0)
-            legal_moves = torch.zeros_like(self.board, dtype=torch.bool)
-            legal_moves[empty_spots] = True
-            return legal_moves
-        else:
-            raise ValueError("Unsupported board type")
+        return torch.nonzero(self.pieces == 0).tolist()
 
     def has_legal_moves(self):
-        for y in range(self.n):
-            for x in range(self.n):
-                if self[x][y] == 0:
-                    return True
-        return False
+        return torch.any(self.pieces == 0)
 
     def is_win(self, color):
+        n = self.pieces.shape[0]
+        
         # Check rows and columns
-        for i in range(self.n):
-            if all(self[i][j] == color for j in range(self.n)) or \
-               all(self[j][i] == color for j in range(self.n)):
-                return True
-
-        # Check diagonals
-        if all(self[i][i] == color for i in range(self.n)) or \
-           all(self[i][self.n-i-1] == color for i in range(self.n)):
+        if torch.any(torch.all(self.pieces == color, dim=1)) or torch.any(torch.all(self.pieces == color, dim=0)):
             return True
-
+        
+        # Check diagonals
+        if torch.all(torch.diag(self.pieces) == color) or torch.all(torch.diag(torch.fliplr(self.pieces)) == color):
+            return True
+        
         return False
 
     def execute_move(self, move, color):
         x, y = move
-        assert self[x][y] == 0
-        self[x][y] = color
+        self.pieces[x, y] = color
 
 
 class RandomPlayer():
