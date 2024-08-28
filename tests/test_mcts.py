@@ -1,6 +1,5 @@
 import unittest
 import torch
-import numpy as np
 from games.tictactoe import TicTacToeGame
 from networks.tictactoe_resnet import NNetWrapper
 from mcts import MCTS
@@ -33,7 +32,7 @@ class TestMCTS(unittest.TestCase):
 
     def test_get_action_prob(self):
         board = self.game.get_init_board()
-        canonical_boards = torch.stack([torch.from_numpy(board)] * 2)
+        canonical_boards = torch.stack([board] * 2)
         probs = self.mcts.get_action_prob(canonical_boards)
         
         self.assertEqual(probs.shape, (2, 10))
@@ -43,7 +42,7 @@ class TestMCTS(unittest.TestCase):
 
     def test_search(self):
         board = self.game.get_init_board()
-        canonical_boards = torch.stack([torch.from_numpy(board)] * 2)
+        canonical_boards = torch.stack([board] * 2)
         self.mcts.search(canonical_boards)
         # Check if root node has been expanded
         self.assertTrue(torch.all(self.mcts.Ns[:, 0] > 0))
@@ -53,7 +52,7 @@ class TestMCTS(unittest.TestCase):
 
     def test_uct_scores(self):
         board = self.game.get_init_board()
-        canonical_boards = torch.stack([torch.from_numpy(board)] * 2)
+        canonical_boards = torch.stack([board] * 2)
         self.mcts.search(canonical_boards)  # Perform one search to populate the tree
         uct_scores = self.mcts._uct_scores(torch.zeros(2, dtype=torch.long))
         self.assertEqual(uct_scores.shape, (2, 10))
@@ -61,7 +60,7 @@ class TestMCTS(unittest.TestCase):
 
     def test_expand(self):
         board = self.game.get_init_board()
-        canonical_boards = torch.stack([torch.from_numpy(board)] * 2)
+        canonical_boards = torch.stack([board] * 2)
         s = torch.zeros(2, dtype=torch.long)
         v = self.mcts._expand(canonical_boards, s)
         self.assertEqual(v.shape, (2,))

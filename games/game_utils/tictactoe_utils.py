@@ -4,13 +4,13 @@ import torch
 class Board:
     def __init__(self, n=3):
         self.n = n
-        self.pieces = torch.zeros((n, n), dtype=torch.int)
+        self.pieces = torch.zeros((n, n), dtype=torch.float32)
 
     def __getitem__(self, index):
         return self.pieces[index]
 
     def get_legal_moves(self):
-        return torch.nonzero(self.pieces == 0).tolist()
+        return torch.nonzero(self.pieces == 0).flatten()
 
     def has_legal_moves(self):
         return torch.any(self.pieces == 0)
@@ -38,10 +38,11 @@ class RandomPlayer():
         self.game = game
 
     def play(self, board):
-        a = np.random.randint(self.game.getActionSize())
-        valids = self.game.getValidMoves(board, 1)
-        while valids[a]!=1:
-            a = np.random.randint(self.game.getActionSize())
+        action_size = self.game.get_action_size()
+        valids = self.game.get_valid_moves(board, 1)
+        a = torch.randint(action_size, (1,)).item()
+        while valids[a] != 1:
+            a = torch.randint(action_size, (1,)).item()
         return a
 
 
@@ -50,19 +51,14 @@ class HumanTicTacToePlayer():
         self.game = game
 
     def play(self, board):
-        # display(board)
-        valid = self.game.getValidMoves(board, 1)
+        valid = self.game.get_valid_moves(board, 1)
         for i in range(len(valid)):
             if valid[i]:
                 print(int(i/self.game.n), int(i%self.game.n))
         while True: 
-            # Python 3.x
             a = input()
-            # Python 2.x 
-            # a = raw_input()
-
             x,y = [int(x) for x in a.split(' ')]
-            a = self.game.n * x + y if x!= -1 else self.game.n ** 2
+            a = self.game.n * x + y if x != -1 else self.game.n ** 2
             if valid[a]:
                 break
             else:

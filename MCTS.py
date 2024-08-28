@@ -36,8 +36,15 @@ class MCTS:
             probs = torch.zeros_like(counts)
             probs.scatter_(1, best_actions.unsqueeze(1), 1)
         else:
-            counts = counts.float() ** (1. / temp)
+            counts = counts.float()
+            if temp != 1:
+                counts = counts ** (1. / temp)
+            counts = torch.clamp(counts, min=1e-8)  # Avoid division by zero
             probs = counts / counts.sum(dim=1, keepdim=True)
+        
+        # Ensure probabilities are non-negative and sum to 1
+        probs = torch.clamp(probs, min=0)
+        probs = probs / probs.sum(dim=1, keepdim=True)
 
         return probs
 
@@ -45,7 +52,11 @@ class MCTS:
         env_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         s = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         
-        while env_mask.any():
+        # Add a depth counter to limit recursion
+        depth = 0
+        max_depth = 1000  # Adjust this value as needed
+        
+        while env_mask.any() and depth < max_depth:
             ended = self.Es[torch.arange(self.num_envs), s] != 0
             if ended.any():
                 env_mask[ended] = False
@@ -54,7 +65,8 @@ class MCTS:
             unvisited = self.Ns[torch.arange(self.num_envs), s] == 0
             if unvisited.any():
                 unvisited_mask = env_mask & unvisited
-                self._expand(canonical_boards[unvisited_mask], s[unvisited_mask])
+                v = self._expand(canonical_boards[unvisited_mask], s[unvisited_mask])
+                self._backpropagate(s[unvisited_mask], torch.zeros_like(s[unvisited_mask]), v)
                 env_mask[unvisited_mask] = False
                 continue
 
@@ -64,13 +76,17 @@ class MCTS:
             a = uct_scores.argmax(dim=1)
 
             next_s, next_player = self.game.get_next_state(canonical_boards, 1, a)
+            next_player = torch.full((self.num_envs,), next_player, device=self.device)
             canonical_boards = self.game.get_canonical_form(next_s, next_player)
             
-            v = -self.search(canonical_boards)
-            
-            self._backpropagate(s, a, v)
+            # Instead of recursive call, update s and continue the loop
             s = self.next_node[torch.arange(self.num_envs)]
             self.next_node += 1
+            depth += 1
+
+        # Handle case where max depth is reached
+        if depth == max_depth:
+            print(f"Warning: Max depth {max_depth} reached in MCTS search")
 
         return -self.Es[torch.arange(self.num_envs), s]
 
@@ -91,12 +107,9 @@ class MCTS:
         self.Ps[torch.arange(len(s)), s] *= valids.to(self.device)
         sum_Ps_s = self.Ps[torch.arange(len(s)), s].sum(dim=1, keepdim=True)
         self.Ps[torch.arange(len(s)), s] /= sum_Ps_s
-        self.Vs[torch.arange(len(s)), s] = valids.to(self.device)
-        game_ended = self.game.get_game_ended(canonical_boards, 1)
-        if isinstance(game_ended, torch.Tensor):
-            self.Es[torch.arange(len(s)), s] = game_ended
-        else:
-            self.Es[torch.arange(len(s)), s] = game_ended
+        self.Vs[torch.arange(len(s)), s] = valids.to(self.device).bool()  # Convert to boolean
+        self.Es[torch.arange(len(s)), s] = self.game.get_game_ended(canonical_boards, 1)
+        v = v.squeeze(-1)
         return -v
 
     def _uct_scores(self, s):

@@ -1,3 +1,4 @@
+# IMPORTANT UPDATE TO USE TENSORS
 import numpy as np
 import chess
 

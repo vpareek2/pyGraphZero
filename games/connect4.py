@@ -1,3 +1,5 @@
+# IMPORTANT UPDATE TO USE TENSORS
+
 import numpy as np
 from games.game_utils.connect4_utils import Board
 

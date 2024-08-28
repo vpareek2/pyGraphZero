@@ -8,7 +8,7 @@ class TicTacToeGame:
 
     def get_init_board(self):
         b = Board(self.n)
-        return np.array(b.pieces)
+        return torch.as_tensor(b.pieces, dtype=torch.float32)
 
     def get_board_size(self):
         return (self.n, self.n)
@@ -17,35 +17,49 @@ class TicTacToeGame:
         return self.n * self.n + 1
 
     def get_next_state(self, board, player, action):
-        if action == self.n * self.n:
-            return (board, -player)
-        b = Board(self.n)
-        b.pieces = np.copy(board)
-        move = (int(action / self.n), action % self.n)
-        b.execute_move(move, player)
-        return (b.pieces, -player)
+        if board.dim() == 2:  # Single board
+            if action == self.n * self.n:
+                return (board, -player)
+            b = Board(self.n)
+            b.pieces = board.cpu().numpy()
+            move = (int(action / self.n), int(action % self.n))
+            b.execute_move(move, player)
+            return (torch.tensor(b.pieces, dtype=torch.float32, device=board.device), -player)
+        elif board.dim() == 3:  # Batched boards
+            next_boards = []
+            for i in range(board.shape[0]):
+                if action[i] == self.n * self.n:
+                    next_boards.append(board[i])
+                else:
+                    b = Board(self.n)
+                    b.pieces = board[i].cpu().numpy()
+                    move = (int(action[i] / self.n), int(action[i] % self.n))
+                    b.execute_move(move, player)
+                    next_boards.append(torch.tensor(b.pieces, dtype=torch.float32, device=board.device))
+            return (torch.stack(next_boards), -player)
+        else:
+            raise ValueError("Unsupported board dimension")
 
     def get_valid_moves(self, board, player):
-        if isinstance(board, np.ndarray):
-            # Single board
-            b = Board(board)
-            legal_moves = b.get_legal_moves()
-            valids = [1 if (i, j) in legal_moves else 0 for i in range(3) for j in range(3)]
-            return np.array(valids)
-        elif isinstance(board, torch.Tensor):
-            # Batched boards
-            empty_spots = (board == 0)
-            legal_moves = empty_spots.view(board.shape[0], -1)
-            return legal_moves
+        if board.dim() == 2:  # Single board
+            valids = torch.zeros(self.n * self.n + 1, dtype=torch.float32, device=board.device)
+            empty_spots = (board == 0).flatten()
+            valids[:self.n * self.n] = empty_spots.float()
+            valids[-1] = 1  # Add pass move
+            return valids
+        elif board.dim() == 3:  # Batched boards
+            empty_spots = (board == 0).view(board.shape[0], -1)
+            pass_move = torch.ones((board.shape[0], 1), dtype=torch.float32, device=board.device)
+            return torch.cat([empty_spots.float(), pass_move], dim=1)
         else:
-            raise ValueError("Unsupported board type")
+            raise ValueError("Unsupported board dimension")
 
     def get_game_ended(self, board, player):
         if board.dim() == 3:  # Batch of boards
             results = []
             for single_board in board:
                 b = Board(single_board.shape[0])
-                b.pieces = single_board
+                b.pieces = single_board  # No need to convert to numpy
                 if b.is_win(player):
                     results.append(1)
                 elif b.is_win(-player):
@@ -54,42 +68,48 @@ class TicTacToeGame:
                     results.append(0)
                 else:
                     results.append(1e-4)  # draw has a very little value
-            return torch.tensor(results, device=board.device)
+            return torch.tensor(results, dtype=torch.float32, device=board.device)
         else:  # Single board
             b = Board(board.shape[0])
-            b.pieces = board
+            b.pieces = board  # No need to convert to numpy
             if b.is_win(player):
-                return 1
+                return torch.tensor(1, dtype=torch.float32, device=board.device)
             if b.is_win(-player):
-                return -1
+                return torch.tensor(-1, dtype=torch.float32, device=board.device)
             if b.has_legal_moves():
-                return 0
-            return 1e-4  # draw has a very little value
+                return torch.tensor(0, dtype=torch.float32, device=board.device)
+            return torch.tensor(1e-4, dtype=torch.float32, device=board.device)  # draw has a very little value
 
     def get_canonical_form(self, board, player):
-        return player * board
+        if board.dim() == 2:  # Single board
+            return player * board
+        elif board.dim() == 3:  # Batched boards
+            return player.view(-1, 1, 1) * board
+        else:
+            raise ValueError("Unsupported board dimension")
 
     def get_symmetries(self, board, pi):
         assert(len(pi) == self.n**2 + 1)  # 1 for pass
-        pi_board = np.reshape(pi[:-1], (self.n, self.n))
+        pi_board = torch.reshape(pi[:-1], (self.n, self.n))
         l = []
 
         for i in range(1, 5):
             for j in [True, False]:
-                newB = np.rot90(board, i)
-                newPi = np.rot90(pi_board, i)
+                newB = torch.rot90(board, i)
+                newPi = torch.rot90(pi_board, i)
                 if j:
-                    newB = np.fliplr(newB)
-                    newPi = np.fliplr(newPi)
-                l += [(newB, list(newPi.ravel()) + [pi[-1]])]
+                    newB = torch.fliplr(newB)
+                    newPi = torch.fliplr(newPi)
+                l += [(newB, torch.cat([newPi.flatten(), pi[-1].unsqueeze(0)]))]
         return l
 
     def string_representation(self, board):
-        return board.tobytes()
+        return board.cpu().numpy().tobytes()
 
     @staticmethod
     def display(board):
         n = board.shape[0]
+        board_np = board.cpu().numpy()
 
         print("   ", end="")
         for y in range(n):
@@ -102,7 +122,7 @@ class TicTacToeGame:
         for y in range(n):
             print(y, "|", end="")
             for x in range(n):
-                piece = board[y][x]
+                piece = board_np[y][x]
                 if piece == -1:
                     print("X ", end="")
                 elif piece == 1:
