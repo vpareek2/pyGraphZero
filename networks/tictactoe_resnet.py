@@ -1,19 +1,3 @@
-"""
-This file contains the implementation of the Residual Network built for TicTacToe, per the original AlphaZero architecture. The file contains 3 classes
-
-    Class: ResBlock
-        def __init__(nn.Module)
-        def forward(self, x)
-
-    Class: TicTacToe Resnet
-        def __init__(nn.Module)
-        def forward(self, s)
-        def train_step(self, examples)
-        def loss_pi(self, targets, outputs)
-"""
-
-
-
 import os
 import time
 import numpy as np
@@ -23,6 +7,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.cuda.amp import autocast, GradScaler
+
 
 # Residual Block Class
 class ResBlock(nn.Module):
@@ -141,7 +129,6 @@ class TicTacToeResNet(nn.Module):
         checkpoint = torch.load(filepath)
         self.load_state_dict(checkpoint['state_dict'])
 
-# Wrapper of Resnet, for simple interchangability with GAT
 class NNetWrapper:
     def __init__(self, game, args):
         self.game = game
@@ -164,8 +151,42 @@ class NNetWrapper:
             self.nnet = nn.DataParallel(self.nnet)
 
         self.optimizer = optim.Adam(self.nnet.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5, verbose=True)
+        self.scaler = GradScaler()
+
+        self.best_val_loss = float('inf')
+        self.patience = 10
+        self.wait = 0
+
+    def augment_board(self, board):
+        # Assuming board is a 3x3 numpy array
+        augmented = []
+        for k in range(4):
+            rotated = np.rot90(board, k)
+            augmented.append(rotated)
+            augmented.append(np.fliplr(rotated))
+        return augmented
+
+    def augment_batch(self, boards):
+        augmented = []
+        for board in boards:
+            for k in range(4):
+                rotated = torch.rot90(board, k, [1, 2])
+                augmented.append(rotated)
+                augmented.append(torch.flip(rotated, [2]))
+        return torch.stack(augmented)
 
     def train(self, examples):
+        # Augment the data
+        augmented_examples = []
+        for board, pi, v in examples:
+            augmented_boards = self.augment_board(board)
+            augmented_examples.extend([(b, pi, v) for b in augmented_boards])
+        examples = augmented_examples
+
+        # Split into training and validation sets
+        train_examples, val_examples = train_test_split(examples, test_size=0.2)
+
         for epoch in range(self.args.epochs):
             if self.args.distributed:
                 self.train_sampler.set_epoch(epoch)
@@ -173,26 +194,30 @@ class NNetWrapper:
             print(f'Epoch {epoch+1}/{self.args.epochs}')
             self.nnet.train()
             total_loss, pi_losses, v_losses = 0, 0, 0
-            batch_count = int(len(examples) / self.args.batch_size)
+            batch_count = int(len(train_examples) / self.args.batch_size)
             
             for _ in range(batch_count):
-                sample_ids = np.random.randint(len(examples), size=self.args.batch_size)
-                batch_examples = [examples[i] for i in sample_ids]
+                sample_ids = np.random.randint(len(train_examples), size=self.args.batch_size)
+                batch_examples = [train_examples[i] for i in sample_ids]
                 boards, target_pis, target_vs = list(zip(*batch_examples))
                 boards = torch.FloatTensor(np.array(boards).astype(np.float64)).to(self.device)
                 target_pis = torch.FloatTensor(np.array(target_pis)).to(self.device)
                 target_vs = torch.FloatTensor(np.array(target_vs)).to(self.device)
 
-                # Compute output
-                out_pi, out_v = self.nnet(boards)
-                l_pi = self.loss_pi(target_pis, out_pi)
-                l_v = self.loss_v(target_vs, out_v.squeeze(-1))
-                total_loss = l_pi + l_v
+                # Augment the batch
+                boards = self.augment_batch(boards)
+                # Adjust target_pis and target_vs accordingly
 
-                # Compute gradient and do SGD step
+                with autocast():
+                    out_pi, out_v = self.nnet(boards)
+                    l_pi = self.loss_pi(target_pis, out_pi)
+                    l_v = self.loss_v(target_vs, out_v.squeeze(-1))
+                    total_loss = l_pi + l_v
+
                 self.optimizer.zero_grad()
-                total_loss.backward()
-                self.optimizer.step()
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
                 total_loss += total_loss.item()
                 pi_losses += l_pi.item()
@@ -209,6 +234,40 @@ class NNetWrapper:
             print(f'Average Loss: {total_loss/batch_count:.3f} | '
                   f'Pi Loss: {pi_losses/batch_count:.3f} | '
                   f'V Loss: {v_losses/batch_count:.3f}')
+
+            # Validation step
+            self.nnet.eval()
+            val_loss, val_pi_loss, val_v_loss = 0, 0, 0
+            with torch.no_grad():
+                for board, target_pi, target_v in val_examples:
+                    board = torch.FloatTensor(board.astype(np.float64)).unsqueeze(0).to(self.device)
+                    target_pi = torch.FloatTensor(target_pi).unsqueeze(0).to(self.device)
+                    target_v = torch.FloatTensor([target_v]).to(self.device)
+                    
+                    out_pi, out_v = self.nnet(board)
+                    l_pi = self.loss_pi(target_pi, out_pi)
+                    l_v = self.loss_v(target_v, out_v)
+                    val_loss += l_pi + l_v
+                    val_pi_loss += l_pi
+                    val_v_loss += l_v
+            
+            val_count = len(val_examples)
+            print(f'Validation Loss: {val_loss/val_count:.3f} | '
+                  f'Val Pi Loss: {val_pi_loss/val_count:.3f} | '
+                  f'Val V Loss: {val_v_loss/val_count:.3f}')
+            
+            # At the end of each epoch:
+            self.scheduler.step(val_loss)
+
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.wait = 0
+                self.save_checkpoint()  # Save the best model
+            else:
+                self.wait += 1
+                if self.wait >= self.patience:
+                    print("Early stopping")
+                    break
 
     def predict(self, board):
         start = time.time()
