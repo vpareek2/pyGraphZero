@@ -21,11 +21,10 @@ class Coach():
     def __init__(self, game, nnet, args):
         self.game = game
         self.args = args
+        self.nnet = nnet
         
         if args.distributed:
             self.device = torch.device(f"cuda:{args.local_rank}")
-            torch.cuda.set_device(self.device)
-            dist.init_process_group(backend='nccl')
             self.world_size = dist.get_world_size()
             self.rank = dist.get_rank()
         else:
@@ -33,11 +32,10 @@ class Coach():
             self.world_size = 1
             self.rank = 0
 
-        self.nnet = nnet.to(self.device)
+        self.pnet = self.nnet.__class__(self.game)
         if args.distributed:
-            self.nnet = DDP(self.nnet, device_ids=[args.local_rank])
+            self.pnet.setup_distributed(args)
         
-        self.pnet = self.nnet.__class__(self.game).to(self.device)
         self.mcts = MCTS(self.game, self.nnet, self.args)
         self.trainExamplesHistory = []
         self.skipFirstSelfPlay = False
@@ -80,11 +78,17 @@ class Coach():
                     iterationTrainExamples += self.executeEpisode()
 
                 # Gather examples from all processes
-                all_examples = [None for _ in range(self.world_size)]
-                dist.all_gather_object(all_examples, iterationTrainExamples)
-                
+                if self.args.distributed:
+                    all_examples = [None for _ in range(self.world_size)]
+                    dist.all_gather_object(all_examples, iterationTrainExamples)
+                    
+                    if self.rank == 0:
+                        iterationTrainExamples = deque(sum(all_examples, []), maxlen=self.args.maxlenOfQueue)
+                else:
+                    if self.rank == 0:
+                        iterationTrainExamples = deque(iterationTrainExamples, maxlen=self.args.maxlenOfQueue)
+
                 if self.rank == 0:
-                    iterationTrainExamples = deque(sum(all_examples, []), maxlen=self.args.maxlenOfQueue)
                     self.trainExamplesHistory.append(iterationTrainExamples)
 
                     if len(self.trainExamplesHistory) > self.args.numItersForTrainExamplesHistory:
@@ -105,9 +109,11 @@ class Coach():
                 self.pnet.load_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
                 pmcts = MCTS(self.game, self.pnet, self.args)
 
-            dist.barrier()
+            if self.args.distributed:
+                dist.barrier()
             self.nnet.train(trainExamples)
-            dist.barrier()
+            if self.args.distributed:
+                dist.barrier()
 
             if self.rank == 0:
                 nmcts = MCTS(self.game, self.nnet, self.args)
@@ -126,7 +132,8 @@ class Coach():
                     self.nnet.save_checkpoint(folder=self.args.checkpoint, filename=self.getCheckpointFile(i))
                     self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='best.pth.tar')
 
-            dist.barrier()
+            if self.args.distributed:
+                dist.barrier()
 
     def getCheckpointFile(self, iteration):
         return 'checkpoint_' + str(iteration) + '.pth.tar'
@@ -158,4 +165,5 @@ class Coach():
                 # examples based on the model were already collected (loaded)
                 self.skipFirstSelfPlay = True
 
-        dist.barrier()
+        if self.args.distributed:
+            dist.barrier()

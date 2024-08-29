@@ -4,14 +4,14 @@ import os
 import argparse
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from alphazero.self_play import Coach
+from self_play import Coach
 from games.tictactoe import TicTacToeGame
-from networks.tictactoe_resnet import NNetWrapper as nn
-# from networks.tictactoe_gat import NNetWrapper as nn
-# from networks.connect4_resnet import NNetWrapper as nn
-# from networks.connect4_gat import NNetWrapper as nn
-# from networks.chess_resnet import NNetWrapper as nn
-# from networks.chess_gat import NNetWrapper as nn
+from networks.tictactoe_resnet import NNetWrapper as resnet_nn
+from networks.tictactoe_gat import NNetWrapper as gat_nn
+# from networks.connect4_resnet import NNetWrapper as resnet_nn
+# from networks.connect4_gat import NNetWrapper as gat_nn
+# from networks.chess_resnet import NNetWrapper as resnet_nn
+# from networks.chess_gat import NNetWrapper as gat_nn
 from utils import *
 
 def setup(rank, world_size):
@@ -31,8 +31,15 @@ def run_training(rank, world_size, args):
     log.info('Loading %s...', TicTacToeGame.__name__)
     g = TicTacToeGame()
 
-    log.info('Loading %s...', nn.__name__)
-    nnet = nn(g)
+    log.info('Loading %s...', args.nn_type)
+    if args.nn_type == 'gat':
+        nnet = gat_nn(g)
+    else:
+        nnet = resnet_nn(g)
+
+    if args.distributed:
+        args.local_rank = rank
+        nnet.setup_distributed(args)
 
     if args.load_model:
         log.info('Loading checkpoint "%s/%s"...', args.load_folder_file[0], args.load_folder_file[1])
@@ -58,6 +65,7 @@ if __name__ == "__main__":
     parser.add_argument('--world_size', type=int, default=1, help='Number of processes for distributed training')
     parser.add_argument('--load_model', action='store_true', help='Load a pre-trained model')
     parser.add_argument('--load_folder_file', nargs=2, type=str, default=('/dev/models/8x100x50', 'best.pth.tar'), help='Folder and file to load the model from')
+    parser.add_argument('--nn_type', type=str, choices=['resnet', 'gat'], default='resnet', help='Type of neural network to use')
     
     cli_args = parser.parse_args()
 
@@ -76,10 +84,11 @@ if __name__ == "__main__":
         'numItersForTrainExamplesHistory': 20,
         'distributed': cli_args.distributed,
         'world_size': cli_args.world_size,
+        'nn_type': cli_args.nn_type,
     })
 
-# Usage: python main.py --distributed --world_size 8
-# Means 8 gpus.
+# Usage: python main.py --distributed --world_size 8 --nn_type gat
+# Means 8 gpus with GAT network.
 
     if args.distributed:
         mp.spawn(run_training, args=(args.world_size, args), nprocs=args.world_size, join=True)
