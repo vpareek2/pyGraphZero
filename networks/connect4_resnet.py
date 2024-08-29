@@ -78,7 +78,7 @@ class Connect4ResNet(nn.Module):
         v = self.dropout(v)
         v = F.relu(self.v_fc1(v))
         v = self.dropout(v)
-        v = self.v_fc2(v)
+        v = self.v_fc2(v).squeeze(-1)
 
         return F.log_softmax(pi, dim=1), torch.tanh(v)
 
@@ -110,33 +110,36 @@ class Connect4ResNet(nn.Module):
         return torch.sum((targets - outputs) ** 2) / targets.size()[0]
 
     def predict(self, board):
-        start = time.time()
+        """
+        board: np array with board
+        """
+        # Input validation
+        if not isinstance(board, np.ndarray):
+            raise ValueError(f"Invalid input type. Expected numpy array, got {type(board)}")
+        if board.shape != (6, 7):  # Update for Connect4 board size
+            raise ValueError(f"Invalid board shape. Expected (6, 7), got {board.shape}")
+        if not np.issubdtype(board.dtype, np.number):
+            raise ValueError(f"Invalid board data type. Expected numeric type, got {board.dtype}")
+        if not np.all(np.isin(board, [0, 1, -1])):  # Update valid values for Connect4
+            raise ValueError("Invalid board values. Expected only 0, 1, or -1")
+
+        # Prepare input
+        board = torch.FloatTensor(board.astype(np.float64))
+        board = board.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
         
-        # Convert to torch tensor if it's not already
-        if not isinstance(board, torch.Tensor):
-            board = torch.FloatTensor(board)
-        
-        # Ensure the input is 4D: [batch_size, channels, height, width]
-        if board.dim() == 2:
-            board = board.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
-        elif board.dim() == 3:
-            board = board.unsqueeze(1)  # Add channel dimension
-        elif board.dim() != 4:
-            raise ValueError(f"Invalid input shape. Expected 2D, 3D or 4D tensor, got {board.dim()}D")
-        
-        # Verify the board dimensions
-        if board.shape[-2:] != (self.board_x, self.board_y):
-            raise ValueError(f"Invalid board dimensions. Expected {self.board_x}x{self.board_y}, got {board.shape[-2]}x{board.shape[-1]}")
-        
+        # Move the input tensor to the same device as the model
         board = board.to(self.device)
         
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
-        
-        print(f'PREDICTION TIME TAKEN: {time.time() - start:.3f}')
-        
-        return torch.exp(pi), v
+
+        # Ensure pi has shape (1, 7) and v has shape (1,)
+        pi = pi.view(1, -1)
+        v = v.view(-1)
+
+        # Move tensors to CPU and detach from computation graph
+        return pi.cpu().detach(), v.cpu().detach()
 
     def save_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
         filepath = os.path.join(folder, filename)
@@ -272,7 +275,7 @@ class NNetWrapper:
             with autocast(device_type=self.device.type):
                 out_pi, out_v = self.nnet(boards)
                 loss_pi = self.criterion_pi(out_pi, target_pis)
-                loss_v = self.criterion_v(out_v, target_vs)
+                loss_v = self.criterion_v(out_v.squeeze(-1), target_vs.squeeze(-1))
                 total_loss = loss_pi + loss_v
             
             self.scaler.scale(total_loss).backward()
@@ -296,7 +299,7 @@ class NNetWrapper:
                 
                 out_pi, out_v = self.nnet(board)
                 l_pi = self.criterion_pi(out_pi, target_pi)
-                l_v = self.criterion_v(out_v.squeeze(-1), target_v)
+                l_v = self.criterion_v(out_v.squeeze(-1), target_v.squeeze(-1))
                 val_loss += (l_pi + l_v).item()
 
         if self.args.distributed:
