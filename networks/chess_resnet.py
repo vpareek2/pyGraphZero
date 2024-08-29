@@ -1,5 +1,4 @@
 import os
-import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -78,7 +77,8 @@ class ChessResNet(nn.Module):
         v = self.dropout(v)
         v = F.relu(self.v_fc1(v))
         v = self.dropout(v)
-        v = self.v_fc2(v).squeeze(-1)
+        v = self.v_fc2(v)
+        v = v.squeeze(-1)  # Ensure v has shape (batch_size,)
 
         return F.log_softmax(pi, dim=1), torch.tanh(v)
 
@@ -130,9 +130,9 @@ class ChessResNet(nn.Module):
         # Move the input tensor to the same device as the model
         board = board.to(self.device)
         
-        self.nnet.eval()
+        self.eval()
         with torch.no_grad():
-            pi, v = self.nnet(board)
+            pi, v = self(board)
 
         # Ensure pi has shape (1, 8*8*73) and v has shape (1,)
         pi = pi.view(1, -1)
@@ -188,10 +188,11 @@ class NNetWrapper:
         self.best_val_loss = float('inf')
         self.patience = 10
         self.wait = 0
+        self.best_model = None
 
-        if self.is_main_process():
-            wandb.init(project="chess-resnet", config=vars(args))
-            wandb.watch(self.nnet)
+        # if self.is_main_process():
+        #     wandb.init(project="chess-resnet", config=vars(args))
+        #     wandb.watch(self.nnet)
 
     def setup_distributed(self):
         self.args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -251,15 +252,20 @@ class NNetWrapper:
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self.wait = 0
+                    self.best_model = self.get_model_state()
                     self.save_checkpoint()
                 else:
                     self.wait += 1
                     if self.wait >= self.patience:
                         print("Early stopping")
+                        self.load_best_model()
                         break
 
             if self.args.distributed:
                 dist.barrier()
+
+        if self.is_main_process():
+            print(f"Best validation loss: {self.best_val_loss}")
 
     def train_epoch(self, train_loader, epoch):
         self.nnet.train()
@@ -332,9 +338,9 @@ class NNetWrapper:
         with torch.no_grad():
             pi, v = self.nnet(board)
 
-        # Ensure pi has shape (1, 8*8*73) and v has shape (1,)
-        pi = pi.unsqueeze(0) if pi.dim() == 1 else pi
-        v = v.unsqueeze(0) if v.dim() == 1 else v
+        # Ensure pi has shape (1, action_size) and v has shape (1,)
+        pi = pi.view(1, -1)
+        v = v.view(-1)
 
         # Move tensors to CPU and detach from computation graph
         return pi.cpu().detach(), v.cpu().detach()
@@ -418,3 +424,15 @@ class NNetWrapper:
         dist.all_reduce(rt, op=dist.ReduceOp.SUM)
         rt /= self.world_size
         return rt
+
+    def get_model_state(self):
+        if isinstance(self.nnet, (nn.DataParallel, DDP)):
+            return self.nnet.module.state_dict()
+        return self.nnet.state_dict()
+
+    def load_best_model(self):
+        if self.best_model is not None:
+            if isinstance(self.nnet, (nn.DataParallel, DDP)):
+                self.nnet.module.load_state_dict(self.best_model)
+            else:
+                self.nnet.load_state_dict(self.best_model)
