@@ -13,6 +13,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.amp import GradScaler, autocast
 import wandb
 
+# Residual Block Class
 class ResBlock(nn.Module):
     def __init__(self, num_channels):
         super(ResBlock, self).__init__()
@@ -29,27 +30,33 @@ class ResBlock(nn.Module):
         out = F.relu(out)
         return out
 
+# Residual Network Class (Tailored to Connect4)
 class Connect4ResNet(nn.Module):
     def __init__(self, game, args):
         super(Connect4ResNet, self).__init__()
-        self.board_x, self.board_y = game.get_board_size()
-        self.action_size = game.get_action_size()
+        self.board_x, self.board_y = game.get_board_size()  # Typically 6x7 for Connect4
+        self.action_size = game.get_action_size()  # Typically 7 for Connect4
         self.args = args
 
+        # Initial convolutional block
         self.conv = nn.Conv2d(1, args.num_channels, kernel_size=3, padding=1)
         self.bn = nn.BatchNorm2d(args.num_channels)
 
+        # Residual blocks
         self.res_blocks = nn.ModuleList([ResBlock(args.num_channels) for _ in range(args.num_res_blocks)])
 
+        # Policy head
         self.pi_conv = nn.Conv2d(args.num_channels, 32, kernel_size=1)
         self.pi_bn = nn.BatchNorm2d(32)
         self.pi_fc = nn.Linear(32 * self.board_x * self.board_y, self.action_size)
 
+        # Value head
         self.v_conv = nn.Conv2d(args.num_channels, 32, kernel_size=1)
         self.v_bn = nn.BatchNorm2d(32)
         self.v_fc1 = nn.Linear(32 * self.board_x * self.board_y, 256)
         self.v_fc2 = nn.Linear(256, 1)
 
+        self.optimizer = optim.Adam(self.parameters(), lr=args.lr, weight_decay=args.l2_regularization)
         self.dropout = nn.Dropout(p=args.dropout_rate)
 
     def forward(self, s):
@@ -59,11 +66,13 @@ class Connect4ResNet(nn.Module):
         for res_block in self.res_blocks:
             s = res_block(s)
 
+        # Policy head
         pi = F.relu(self.pi_bn(self.pi_conv(s)))
         pi = pi.view(-1, 32 * self.board_x * self.board_y)
         pi = self.dropout(pi)
         pi = self.pi_fc(pi)
 
+        # Value head
         v = F.relu(self.v_bn(self.v_conv(s)))
         v = v.view(-1, 32 * self.board_x * self.board_y)
         v = self.dropout(v)
@@ -72,6 +81,81 @@ class Connect4ResNet(nn.Module):
         v = self.v_fc2(v)
 
         return F.log_softmax(pi, dim=1), torch.tanh(v)
+
+    def train_step(self, examples):
+        self.train()
+        
+        boards, target_pis, target_vs = list(zip(*examples))
+        boards = torch.FloatTensor(np.array(boards).astype(np.float64))
+        target_pis = torch.FloatTensor(np.array(target_pis))
+        target_vs = torch.FloatTensor(np.array(target_vs))
+
+        # Compute output
+        out_pi, out_v = self(boards)
+        l_pi = self.loss_pi(target_pis, out_pi)
+        l_v = self.loss_v(target_vs, out_v.squeeze(-1))
+        total_loss = l_pi + l_v
+
+        # Compute gradient and do SGD step
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return total_loss.item(), l_pi.item(), l_v.item()
+
+    def loss_pi(self, targets, outputs):
+        return -torch.sum(targets * outputs) / targets.size()[0]
+
+    def loss_v(self, targets, outputs):
+        return torch.sum((targets - outputs) ** 2) / targets.size()[0]
+
+    def predict(self, board):
+        start = time.time()
+        
+        # Convert to torch tensor if it's not already
+        if not isinstance(board, torch.Tensor):
+            board = torch.FloatTensor(board)
+        
+        # Ensure the input is 4D: [batch_size, channels, height, width]
+        if board.dim() == 2:
+            board = board.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+        elif board.dim() == 3:
+            board = board.unsqueeze(1)  # Add channel dimension
+        elif board.dim() != 4:
+            raise ValueError(f"Invalid input shape. Expected 2D, 3D or 4D tensor, got {board.dim()}D")
+        
+        # Verify the board dimensions
+        if board.shape[-2:] != (self.board_x, self.board_y):
+            raise ValueError(f"Invalid board dimensions. Expected {self.board_x}x{self.board_y}, got {board.shape[-2]}x{board.shape[-1]}")
+        
+        board = board.to(self.device)
+        
+        self.nnet.eval()
+        with torch.no_grad():
+            pi, v = self.nnet(board)
+        
+        print(f'PREDICTION TIME TAKEN: {time.time() - start:.3f}')
+        
+        return torch.exp(pi), v
+
+    def save_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
+        filepath = os.path.join(folder, filename)
+        if not os.path.exists(folder):
+            print(f"Checkpoint Directory does not exist! Making directory {folder}")
+            os.makedirs(folder)
+        else:
+            print("Checkpoint Directory exists!")
+        torch.save({
+            'state_dict': self.nnet.state_dict(),
+        }, filepath)
+
+    def load_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
+        filepath = os.path.join(folder, filename)
+        if not os.path.exists(filepath):
+            raise ValueError(f"No model in path '{filepath}'")
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % self.args.local_rank} if self.args.distributed else self.device
+        checkpoint = torch.load(filepath, map_location=map_location)
+        self.nnet.load_state_dict(checkpoint['state_dict'])
 
 class NNetWrapper:
     def __init__(self, game, args):
@@ -122,6 +206,7 @@ class NNetWrapper:
         augmented_examples = self.augment_examples(examples)
         train_examples, val_examples = train_test_split(augmented_examples, test_size=0.2)
 
+        # Convert lists to numpy arrays first, then to tensors
         boards = np.array([ex[0] for ex in train_examples])
         pis = np.array([ex[1] for ex in train_examples])
         vs = np.array([ex[2] for ex in train_examples])
@@ -220,18 +305,35 @@ class NNetWrapper:
         return val_loss / len(val_examples)
 
     def predict(self, board):
+        """
+        board: np array with board
+        """
+        # Input validation
+        if not isinstance(board, np.ndarray):
+            raise ValueError(f"Invalid input type. Expected numpy array, got {type(board)}")
+        if board.shape != (6, 7):  # Update for Connect4 board size
+            raise ValueError(f"Invalid board shape. Expected (6, 7), got {board.shape}")
+        if not np.issubdtype(board.dtype, np.number):
+            raise ValueError(f"Invalid board data type. Expected numeric type, got {board.dtype}")
+        if not np.all(np.isin(board, [0, 1, -1])):  # Update valid values for Connect4
+            raise ValueError("Invalid board values. Expected only 0, 1, or -1")
+
+        # Prepare input
         board = torch.FloatTensor(board.astype(np.float64))
         board = board.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
         
+        # Move the input tensor to the same device as the model
         board = board.to(self.device)
         
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
 
+        # Ensure pi has shape (1, 10)
         pi = pi.unsqueeze(0) if pi.dim() == 1 else pi
         v = v.unsqueeze(0) if v.dim() == 1 else v
 
+        # Move tensors to CPU and detach from computation graph
         return pi.cpu().detach(), v.cpu().detach()
 
     def save_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
@@ -276,11 +378,14 @@ class NNetWrapper:
     def augment_examples(self, examples):
         augmented = []
         for board, pi, v in examples:
+            # Ensure board is 3D: [channels, height, width]
             if board.ndim == 2:
                 board = board[np.newaxis, :, :]
             
+            # Original example
             augmented.append((board, pi, v))
             
+            # Horizontal flip (the only valid augmentation for Connect4)
             flipped_board = np.flip(board, axis=2)
             flipped_pi = self.flip_policy(pi)
             augmented.append((flipped_board, flipped_pi, v))
@@ -288,9 +393,19 @@ class NNetWrapper:
         return augmented
 
     def flip_policy(self, pi):
-        board_policy = pi[:self.board_x].reshape(1, self.board_x)
-        flipped_board_policy = np.fliplr(board_policy)
-        return np.concatenate([flipped_board_policy.flatten(), pi[self.board_x:]])
+        return np.flip(pi)
+
+    def augment_batch(self, batch):
+        augmented = []
+        for board in batch:
+            # Original
+            augmented.append(board)
+            
+            # Horizontal flip
+            flipped_h = torch.flip(board, [2])
+            augmented.append(flipped_h)
+        
+        return torch.stack(augmented)
 
     def is_main_process(self):
         return not self.args.distributed or (self.args.distributed and self.rank == 0)
