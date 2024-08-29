@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 from games.game_utils.tictactoe_utils import Board
 
@@ -8,35 +7,29 @@ class TicTacToeGame:
 
     def get_init_board(self):
         b = Board(self.n)
-        return torch.as_tensor(b.pieces, dtype=torch.float32)
+        return torch.tensor(b.pieces, dtype=torch.float32)
 
     def get_board_size(self):
         return (self.n, self.n)
 
     def get_action_size(self):
-        return self.n * self.n + 1
+        return self.n * self.n
 
     def get_next_state(self, board, player, action):
         if board.dim() == 2:  # Single board
             if action == self.n * self.n:
                 return (board, -player)
-            b = Board(self.n)
-            b.pieces = board.cpu().numpy()
+            b = board.clone()
             move = (int(action / self.n), int(action % self.n))
-            b.execute_move(move, player)
-            return (torch.tensor(b.pieces, dtype=torch.float32, device=board.device), -player)
+            b[move] = player
+            return (b, -player)
         elif board.dim() == 3:  # Batched boards
-            next_boards = []
+            next_boards = board.clone()
             for i in range(board.shape[0]):
-                if action[i] == self.n * self.n:
-                    next_boards.append(board[i])
-                else:
-                    b = Board(self.n)
-                    b.pieces = board[i].cpu().numpy()
+                if action[i] != self.n * self.n:
                     move = (int(action[i] / self.n), int(action[i] % self.n))
-                    b.execute_move(move, player)
-                    next_boards.append(torch.tensor(b.pieces, dtype=torch.float32, device=board.device))
-            return (torch.stack(next_boards), -player)
+                    next_boards[i, move[0], move[1]] = player
+            return (next_boards, -player)
         else:
             raise ValueError("Unsupported board dimension")
 
@@ -55,28 +48,33 @@ class TicTacToeGame:
             raise ValueError("Unsupported board dimension")
 
     def get_game_ended(self, board, player):
+        def check_win(b):
+            # Check rows, columns and diagonals
+            for i in range(3):
+                if torch.all(b[i] == player) or torch.all(b[:, i] == player):
+                    return True
+            if torch.all(torch.diag(b) == player) or torch.all(torch.diag(b.flip(1)) == player):
+                return True
+            return False
+
         if board.dim() == 3:  # Batch of boards
             results = []
             for single_board in board:
-                b = Board(single_board.shape[0])
-                b.pieces = single_board  # No need to convert to numpy
-                if b.is_win(player):
+                if check_win(single_board):
                     results.append(1)
-                elif b.is_win(-player):
+                elif check_win(-single_board):
                     results.append(-1)
-                elif b.has_legal_moves():
+                elif torch.any(single_board == 0):
                     results.append(0)
                 else:
                     results.append(1e-4)  # draw has a very little value
             return torch.tensor(results, dtype=torch.float32, device=board.device)
         else:  # Single board
-            b = Board(board.shape[0])
-            b.pieces = board  # No need to convert to numpy
-            if b.is_win(player):
+            if check_win(board):
                 return torch.tensor(1, dtype=torch.float32, device=board.device)
-            if b.is_win(-player):
+            if check_win(-board):
                 return torch.tensor(-1, dtype=torch.float32, device=board.device)
-            if b.has_legal_moves():
+            if torch.any(board == 0):
                 return torch.tensor(0, dtype=torch.float32, device=board.device)
             return torch.tensor(1e-4, dtype=torch.float32, device=board.device)  # draw has a very little value
 
@@ -84,7 +82,7 @@ class TicTacToeGame:
         if board.dim() == 2:  # Single board
             return player * board
         elif board.dim() == 3:  # Batched boards
-            return player.view(-1, 1, 1) * board
+            return player * board
         else:
             raise ValueError("Unsupported board dimension")
 
@@ -109,8 +107,6 @@ class TicTacToeGame:
     @staticmethod
     def display(board):
         n = board.shape[0]
-        board_np = board.cpu().numpy()
-
         print("   ", end="")
         for y in range(n):
             print(y, "", end="")
@@ -122,7 +118,7 @@ class TicTacToeGame:
         for y in range(n):
             print(y, "|", end="")
             for x in range(n):
-                piece = board_np[y][x]
+                piece = board[y][x].item()
                 if piece == -1:
                     print("X ", end="")
                 elif piece == 1:
