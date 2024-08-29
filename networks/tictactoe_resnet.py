@@ -10,7 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.amp import autocast, GradScaler
+from torch.amp import GradScaler, autocast
 import wandb
 
 # Residual Block Class
@@ -199,13 +199,22 @@ class NNetWrapper:
         self.rank = dist.get_rank()
 
     def train(self, examples):
+        if not examples:
+            print("No examples to train on. Skipping training.")
+            return
+
         augmented_examples = self.augment_examples(examples)
         train_examples, val_examples = train_test_split(augmented_examples, test_size=0.2)
 
+        # Convert lists to numpy arrays first, then to tensors
+        boards = np.array([ex[0] for ex in train_examples])
+        pis = np.array([ex[1] for ex in train_examples])
+        vs = np.array([ex[2] for ex in train_examples])
+
         train_data = TensorDataset(
-            torch.FloatTensor([ex[0] for ex in train_examples]),
-            torch.FloatTensor([ex[1] for ex in train_examples]),
-            torch.FloatTensor([ex[2] for ex in train_examples])
+            torch.FloatTensor(boards),
+            torch.FloatTensor(pis),
+            torch.FloatTensor(vs)
         )
         
         if self.args.distributed:
@@ -251,50 +260,29 @@ class NNetWrapper:
 
     def train_epoch(self, train_loader, epoch):
         self.nnet.train()
-        total_loss, pi_losses, v_losses = 0, 0, 0
+        total_loss = 0
+        pi_losses = 0
+        v_losses = 0
         
         for batch_idx, (boards, target_pis, target_vs) in enumerate(train_loader):
             boards, target_pis, target_vs = boards.to(self.device), target_pis.to(self.device), target_vs.to(self.device)
             
-            boards = self.augment_batch(boards)
-            # Note: You might need to adjust target_pis and target_vs for the augmented boards
-
-            with autocast():
-                out_pi, out_v = self.nnet(boards)
-                l_pi = self.criterion_pi(out_pi, target_pis)
-                l_v = self.criterion_v(out_v.squeeze(-1), target_vs)
-                loss = l_pi + l_v
-
             self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
+            
+            with autocast(device_type=self.device.type):
+                out_pi, out_v = self.nnet(boards)
+                loss_pi = self.criterion_pi(out_pi, target_pis)
+                loss_v = self.criterion_v(out_v, target_vs)
+                total_loss = loss_pi + loss_v
+            
+            self.scaler.scale(total_loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-
-            total_loss += loss.item()
-            pi_losses += l_pi.item()
-            v_losses += l_v.item()
-
-            if batch_idx % 100 == 0 and self.is_main_process():
-                print(f'Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)}, '
-                      f'Loss: {loss.item():.3f}, Pi Loss: {l_pi.item():.3f}, V Loss: {l_v.item():.3f}')
-                
-                wandb.log({
-                    "batch": batch_idx + epoch * len(train_loader),
-                    "batch_loss": loss.item(),
-                    "batch_pi_loss": l_pi.item(),
-                    "batch_v_loss": l_v.item()
-                })
-
-        if self.args.distributed:
-            total_loss = self.reduce_tensor(torch.tensor(total_loss).to(self.device))
-            pi_losses = self.reduce_tensor(torch.tensor(pi_losses).to(self.device))
-            v_losses = self.reduce_tensor(torch.tensor(v_losses).to(self.device))
-
-        if self.is_main_process():
-            print(f'Epoch {epoch+1} Average Loss: {total_loss/len(train_loader):.3f} | '
-                  f'Pi Loss: {pi_losses/len(train_loader):.3f} | '
-                  f'V Loss: {v_losses/len(train_loader):.3f}')
-
+            
+            total_loss += total_loss.item()
+            pi_losses += loss_pi.item()
+            v_losses += loss_v.item()
+        
         return total_loss, pi_losses, v_losses
 
     def validate(self, val_examples):
@@ -390,34 +378,68 @@ class NNetWrapper:
     def augment_examples(self, examples):
         augmented = []
         for board, pi, v in examples:
+            # Ensure board is 3D: [channels, height, width]
+            if board.ndim == 2:
+                board = board[np.newaxis, :, :]
+            
             # Original example
             augmented.append((board, pi, v))
             
             # Rotations
             for k in range(1, 4):
-                rotated_board = np.rot90(board, k)
-                rotated_pi = np.rot90(pi.reshape(3, 3), k).flatten()
+                rotated_board = np.rot90(board, k, axes=(1, 2))
+                rotated_pi = self.rotate_policy(pi, k)
                 augmented.append((rotated_board, rotated_pi, v))
             
             # Horizontal flip
-            flipped_board = np.fliplr(board)
-            flipped_pi = np.fliplr(pi.reshape(3, 3)).flatten()
+            flipped_board = np.flip(board, axis=2)
+            flipped_pi = self.flip_policy(pi, 'horizontal')
             augmented.append((flipped_board, flipped_pi, v))
             
             # Vertical flip
-            flipped_board = np.flipud(board)
-            flipped_pi = np.flipud(pi.reshape(3, 3)).flatten()
+            flipped_board = np.flip(board, axis=1)
+            flipped_pi = self.flip_policy(pi, 'vertical')
             augmented.append((flipped_board, flipped_pi, v))
-            
+        
         return augmented
 
-    def augment_batch(self, boards):
+    def rotate_policy(self, pi, k):
+        board_policy = pi[:9].reshape(3, 3)
+        rotated_board_policy = np.rot90(board_policy, k)
+        return np.concatenate([rotated_board_policy.flatten(), pi[9:]])
+
+    def flip_policy(self, pi, direction):
+        board_policy = pi[:9].reshape(3, 3)
+        if direction == 'horizontal':
+            flipped_board_policy = np.fliplr(board_policy)
+        elif direction == 'vertical':
+            flipped_board_policy = np.flipud(board_policy)
+        else:
+            raise ValueError("Invalid flip direction. Use 'horizontal' or 'vertical'.")
+        return np.concatenate([flipped_board_policy.flatten(), pi[9:]])
+
+    def augment_batch(self, batch):
         augmented = []
-        for board in boards:
-            for k in range(4):
+        for board in batch:
+            # Original
+            augmented.append(board)
+            
+            # Rotations
+            for k in range(1, 4):
                 rotated = torch.rot90(board, k, [1, 2])
                 augmented.append(rotated)
-                augmented.append(torch.flip(rotated, [2]))
+            
+            # Flips
+            flipped_h = torch.flip(board, [2])
+            flipped_v = torch.flip(board, [1])
+            augmented.append(flipped_h)
+            augmented.append(flipped_v)
+            
+            # Rotations of horizontal flip
+            for k in range(1, 4):
+                rotated_flipped_h = torch.rot90(flipped_h, k, [1, 2])
+                augmented.append(rotated_flipped_h)
+        
         return torch.stack(augmented)
 
     def is_main_process(self):
