@@ -3,6 +3,9 @@ import torch
 import numpy as np
 from networks.tictactoe_resnet import TicTacToeResNet, NNetWrapper
 from games.tictactoe import TicTacToeGame
+import torch.nn as nn
+import torch.distributed as dist
+import wandb
 
 class TestTicTacToeResNet(unittest.TestCase):
     def setUp(self):
@@ -103,6 +106,61 @@ class TestTicTacToeResNet(unittest.TestCase):
         with self.assertRaises(ValueError):
             invalid_values_board = np.array([[2, 0, -1], [0, 1, 0], [-1, 0, 1]])
             self.wrapper.predict(invalid_values_board)
+
+    def test_optimizer_and_scheduler(self):
+        self.assertIsInstance(self.wrapper.optimizer, torch.optim.Adam)
+        self.assertIsInstance(self.wrapper.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
+
+    def test_criterion(self):
+        self.assertIsInstance(self.wrapper.criterion_pi, nn.CrossEntropyLoss)
+        self.assertIsInstance(self.wrapper.criterion_v, nn.MSELoss)
+
+    def test_scaler(self):
+        self.assertIsInstance(self.wrapper.scaler, torch.cuda.amp.GradScaler)
+
+    def test_predict_input_validation(self):
+        # Test invalid input type
+        with self.assertRaises(ValueError):
+            self.wrapper.predict([[1, 0, -1], [0, 1, 0], [-1, 0, 1]])
+
+        # Test invalid board shape
+        with self.assertRaises(ValueError):
+            self.wrapper.predict(np.array([[1, 0], [0, 1]]))
+
+        # Test invalid board values
+        with self.assertRaises(ValueError):
+            self.wrapper.predict(np.array([[2, 0, -1], [0, 1, 0], [-1, 0, 1]]))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_gpu_usage(self):
+        self.assertIsInstance(self.wrapper.device, torch.device)
+        self.assertTrue(self.wrapper.device.type in ['cuda', 'cpu'])
+
+    def test_wandb_initialization(self):
+        # This test assumes wandb is initialized in the main process
+        if self.wrapper.is_main_process():
+            self.assertTrue(wandb.run is not None)
+
+    def test_early_stopping(self):
+        # Simulate early stopping scenario
+        self.wrapper.best_val_loss = 1.0
+        self.wrapper.wait = 0
+        self.wrapper.patience = 3
+
+        for i in range(5):
+            val_loss = 1.1  # Always worse than best_val_loss
+            self.wrapper.validate = lambda x: val_loss  # Mock validate method
+            self.wrapper.train([])  # Call train method
+            if i < 3:
+                self.assertEqual(self.wrapper.wait, i + 1)
+            else:
+                self.assertEqual(self.wrapper.wait, 3)  # Should stop increasing at patience limit
+
+    def test_distributed_setup(self):
+        if self.wrapper.args.distributed:
+            self.assertIsNotNone(self.wrapper.world_size)
+            self.assertIsNotNone(self.wrapper.rank)
+            self.assertTrue(dist.is_initialized())
 
 if __name__ == '__main__':
     unittest.main()
