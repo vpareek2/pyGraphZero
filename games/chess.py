@@ -1,4 +1,3 @@
-# IMPORTANT UPDATE TO USE TENSORS
 import torch
 import chess
 
