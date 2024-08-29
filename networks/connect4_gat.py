@@ -335,7 +335,7 @@ class NNetWrapper:
             
             # Apply data augmentation
             augmented_boards, augmented_pis = self.augment_batch(boards, target_pis)
-            augmented_vs = target_vs.repeat(6)  # Repeat the target values for each augmentation
+            augmented_vs = target_vs.repeat(2)  # Repeat the target values for each augmentation (original + flipped)
             
             self.optimizer.zero_grad()
             
@@ -397,8 +397,8 @@ class NNetWrapper:
         # Input validation
         if not isinstance(board, np.ndarray):
             raise ValueError(f"Invalid input type. Expected numpy array, got {type(board)}")
-        if board.shape != (self.board_y, self.board_x):
-            raise ValueError(f"Invalid board shape. Expected ({self.board_y}, {self.board_x}), got {board.shape}")
+        if board.shape != (self.board_x, self.board_y):  # Changed order to match (6, 7)
+            raise ValueError(f"Invalid board shape. Expected ({self.board_x}, {self.board_y}), got {board.shape}")
         if not np.issubdtype(board.dtype, np.number):
             raise ValueError(f"Invalid board data type. Expected numeric type, got {board.dtype}")
         if not np.all(np.isin(board, [-1, 0, 1])):

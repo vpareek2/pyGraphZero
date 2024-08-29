@@ -11,7 +11,7 @@ class Connect4Game:
         return torch.zeros((self.height, self.width), dtype=torch.float32)
 
     def get_board_size(self):
-        return (self.height, self.width)
+        return (6, 7)  # (rows, columns)
 
     def get_action_size(self):
         return self.width
