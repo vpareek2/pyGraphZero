@@ -7,10 +7,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
-
+import wandb
 
 # Residual Block Class
 class ResBlock(nn.Module):
@@ -164,22 +165,20 @@ class NNetWrapper:
         self.action_size = game.get_action_size()
 
         if args.distributed:
-            self.device = torch.device(f"cuda:{args.local_rank}")
-            torch.cuda.set_device(self.device)
-            dist.init_process_group(backend='nccl')
+            self.setup_distributed()
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.nnet = TicTacToeResNet(game, args).to(self.device)
 
         if args.distributed:
-            self.nnet = DDP(self.nnet, device_ids=[args.local_rank])
+            self.nnet = DDP(self.nnet, device_ids=[self.args.local_rank], output_device=self.args.local_rank)
         elif torch.cuda.device_count() > 1:
             self.nnet = nn.DataParallel(self.nnet)
 
         self.optimizer = optim.Adam(self.nnet.parameters(), lr=args.lr, weight_decay=args.l2_regularization)
         self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5)
-        self.scaler = GradScaler('cuda')
+        self.scaler = GradScaler()
         self.criterion_pi = nn.CrossEntropyLoss()
         self.criterion_v = nn.MSELoss()
 
@@ -187,118 +186,135 @@ class NNetWrapper:
         self.patience = 10
         self.wait = 0
 
-    def augment_examples(self, examples):
-        augmented_examples = []
-        for board, pi, v in examples:
-            pi_board = pi[:9].reshape(3, 3)  # Reshape first 9 elements to 3x3
-            pi_pass = pi[9]  # Save the pass move probability
-            for k in range(4):
-                rotated_board = np.rot90(board, k)
-                rotated_pi_board = np.rot90(pi_board, k).flatten()
-                rotated_pi = np.append(rotated_pi_board, pi_pass)  # Reattach pass move
-                augmented_examples.append((rotated_board, rotated_pi, v))
-                
-                flipped_board = np.fliplr(rotated_board)
-                flipped_pi_board = np.fliplr(rotated_pi_board.reshape(3, 3)).flatten()
-                flipped_pi = np.append(flipped_pi_board, pi_pass)  # Reattach pass move
-                augmented_examples.append((flipped_board, flipped_pi, v))
-        return augmented_examples
+        if self.is_main_process():
+            wandb.init(project="tictactoe-resnet", config=vars(args))
+            wandb.watch(self.nnet)
 
-    def augment_batch(self, boards):
-        augmented = []
-        for board in boards:
-            for k in range(4):
-                rotated = torch.rot90(board, k, [1, 2])
-                augmented.append(rotated)
-                augmented.append(torch.flip(rotated, [2]))
-        return torch.stack(augmented)
+    def setup_distributed(self):
+        self.args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.device = torch.device(f"cuda:{self.args.local_rank}")
+        torch.cuda.set_device(self.device)
+        dist.init_process_group(backend='nccl')
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
 
     def train(self, examples):
-        # Augment the data
         augmented_examples = self.augment_examples(examples)
         train_examples, val_examples = train_test_split(augmented_examples, test_size=0.2)
 
+        train_data = TensorDataset(
+            torch.FloatTensor([ex[0] for ex in train_examples]),
+            torch.FloatTensor([ex[1] for ex in train_examples]),
+            torch.FloatTensor([ex[2] for ex in train_examples])
+        )
+        
+        if self.args.distributed:
+            train_sampler = DistributedSampler(train_data, num_replicas=self.world_size, rank=self.rank)
+            train_loader = DataLoader(train_data, batch_size=self.args.batch_size, sampler=train_sampler)
+        else:
+            train_loader = DataLoader(train_data, batch_size=self.args.batch_size, shuffle=True)
+
         for epoch in range(self.args.epochs):
             if self.args.distributed:
-                self.train_sampler.set_epoch(epoch)
+                train_sampler.set_epoch(epoch)
             
-            print(f'Epoch {epoch+1}/{self.args.epochs}')
-            self.nnet.train()
-            total_loss, pi_losses, v_losses = 0, 0, 0
-            batch_count = int(len(train_examples) / self.args.batch_size)
+            total_loss, pi_losses, v_losses = self.train_epoch(train_loader, epoch)
+            val_loss = self.validate(val_examples)
             
-            for _ in range(batch_count):
-                sample_ids = np.random.randint(len(train_examples), size=self.args.batch_size)
-                batch_examples = [train_examples[i] for i in sample_ids]
-                boards, target_pis, target_vs = list(zip(*batch_examples))
-                boards = torch.FloatTensor(np.array(boards).astype(np.float64)).to(self.device)
-                target_pis = torch.FloatTensor(np.array(target_pis)).to(self.device)
-                target_vs = torch.FloatTensor(np.array(target_vs)).to(self.device)
+            if self.is_main_process():
+                print(f'Epoch {epoch+1}/{self.args.epochs}')
+                print(f'Validation Loss: {val_loss:.3f}')
+                
+                wandb.log({
+                    "epoch": epoch,
+                    "train_loss": total_loss / len(train_loader),
+                    "train_pi_loss": pi_losses / len(train_loader),
+                    "train_v_loss": v_losses / len(train_loader),
+                    "val_loss": val_loss,
+                    "learning_rate": self.optimizer.param_groups[0]['lr']
+                })
+                
+                self.scheduler.step(val_loss)
 
-                # Augment the batch
-                boards = self.augment_batch(boards)
-                # Adjust target_pis and target_vs accordingly
-
-                with autocast():
-                    out_pi, out_v = self.nnet(boards)
-                    l_pi = self.criterion_pi(out_pi, target_pis)
-                    l_v = self.criterion_v(out_v.squeeze(-1), target_vs)
-                    total_loss = l_pi + l_v
-
-                self.optimizer.zero_grad()
-                self.scaler.scale(total_loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-
-                total_loss += total_loss.item()
-                pi_losses += l_pi.item()
-                v_losses += l_v.item()
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self.wait = 0
+                    self.save_checkpoint()
+                else:
+                    self.wait += 1
+                    if self.wait >= self.patience:
+                        print("Early stopping")
+                        break
 
             if self.args.distributed:
-                dist.all_reduce(total_loss)
-                dist.all_reduce(pi_losses)
-                dist.all_reduce(v_losses)
-                total_loss /= dist.get_world_size()
-                pi_losses /= dist.get_world_size()
-                v_losses /= dist.get_world_size()
+                dist.barrier()
 
-            print(f'Average Loss: {total_loss/batch_count:.3f} | '
-                  f'Pi Loss: {pi_losses/batch_count:.3f} | '
-                  f'V Loss: {v_losses/batch_count:.3f}')
-
-            # Validation step
-            self.nnet.eval()
-            val_loss, val_pi_loss, val_v_loss = 0, 0, 0
-            with torch.no_grad():
-                for board, target_pi, target_v in val_examples:
-                    board = torch.FloatTensor(board.astype(np.float64)).unsqueeze(0).to(self.device)
-                    target_pi = torch.FloatTensor(target_pi).unsqueeze(0).to(self.device)
-                    target_v = torch.FloatTensor([target_v]).to(self.device)
-                    
-                    out_pi, out_v = self.nnet(board)
-                    l_pi = self.criterion_pi(out_pi, target_pi)
-                    l_v = self.criterion_v(out_v.squeeze(-1), target_v)
-                    val_loss += l_pi + l_v
-                    val_pi_loss += l_pi
-                    val_v_loss += l_v
+    def train_epoch(self, train_loader, epoch):
+        self.nnet.train()
+        total_loss, pi_losses, v_losses = 0, 0, 0
+        
+        for batch_idx, (boards, target_pis, target_vs) in enumerate(train_loader):
+            boards, target_pis, target_vs = boards.to(self.device), target_pis.to(self.device), target_vs.to(self.device)
             
-            val_count = len(val_examples)
-            print(f'Validation Loss: {val_loss/val_count:.3f} | '
-                  f'Val Pi Loss: {val_pi_loss/val_count:.3f} | '
-                  f'Val V Loss: {val_v_loss/val_count:.3f}')
-            
-            # At the end of each epoch:
-            self.scheduler.step(val_loss)
+            boards = self.augment_batch(boards)
+            # Note: You might need to adjust target_pis and target_vs for the augmented boards
 
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.wait = 0
-                self.save_checkpoint()  # Save the best model
-            else:
-                self.wait += 1
-                if self.wait >= self.patience:
-                    print("Early stopping")
-                    break
+            with autocast():
+                out_pi, out_v = self.nnet(boards)
+                l_pi = self.criterion_pi(out_pi, target_pis)
+                l_v = self.criterion_v(out_v.squeeze(-1), target_vs)
+                loss = l_pi + l_v
+
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            total_loss += loss.item()
+            pi_losses += l_pi.item()
+            v_losses += l_v.item()
+
+            if batch_idx % 100 == 0 and self.is_main_process():
+                print(f'Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)}, '
+                      f'Loss: {loss.item():.3f}, Pi Loss: {l_pi.item():.3f}, V Loss: {l_v.item():.3f}')
+                
+                wandb.log({
+                    "batch": batch_idx + epoch * len(train_loader),
+                    "batch_loss": loss.item(),
+                    "batch_pi_loss": l_pi.item(),
+                    "batch_v_loss": l_v.item()
+                })
+
+        if self.args.distributed:
+            total_loss = self.reduce_tensor(torch.tensor(total_loss).to(self.device))
+            pi_losses = self.reduce_tensor(torch.tensor(pi_losses).to(self.device))
+            v_losses = self.reduce_tensor(torch.tensor(v_losses).to(self.device))
+
+        if self.is_main_process():
+            print(f'Epoch {epoch+1} Average Loss: {total_loss/len(train_loader):.3f} | '
+                  f'Pi Loss: {pi_losses/len(train_loader):.3f} | '
+                  f'V Loss: {v_losses/len(train_loader):.3f}')
+
+        return total_loss, pi_losses, v_losses
+
+    def validate(self, val_examples):
+        self.nnet.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for board, target_pi, target_v in val_examples:
+                board = torch.FloatTensor(board.astype(np.float64)).unsqueeze(0).to(self.device)
+                target_pi = torch.FloatTensor(target_pi).unsqueeze(0).to(self.device)
+                target_v = torch.FloatTensor([target_v]).to(self.device)
+                
+                out_pi, out_v = self.nnet(board)
+                l_pi = self.criterion_pi(out_pi, target_pi)
+                l_v = self.criterion_v(out_v.squeeze(-1), target_v)
+                val_loss += (l_pi + l_v).item()
+
+        if self.args.distributed:
+            val_loss = self.reduce_tensor(torch.tensor(val_loss).to(self.device))
+
+        return val_loss / len(val_examples)
 
     def predict(self, board):
         """
@@ -333,20 +349,82 @@ class NNetWrapper:
         return pi.cpu().detach(), v.cpu().detach()
 
     def save_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
+        if not self.is_main_process():
+            return
+
         filepath = os.path.join(folder, filename)
         if not os.path.exists(folder):
-            print(f"Checkpoint Directory does not exist! Making directory {folder}")
             os.makedirs(folder)
-        else:
-            print("Checkpoint Directory exists!")
+
         torch.save({
-            'state_dict': self.nnet.state_dict(),
+            'state_dict': self.nnet.module.state_dict() if isinstance(self.nnet, (nn.DataParallel, DDP)) else self.nnet.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'scaler': self.scaler.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'wait': self.wait,
         }, filepath)
+
+        if self.is_main_process():
+            wandb.save(filepath)
 
     def load_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
         filepath = os.path.join(folder, filename)
         if not os.path.exists(filepath):
             raise ValueError(f"No model in path '{filepath}'")
+
         map_location = {'cuda:%d' % 0: 'cuda:%d' % self.args.local_rank} if self.args.distributed else self.device
-        checkpoint = torch.load(filepath, map_location=map_location, weights_only=True)
-        self.nnet.load_state_dict(checkpoint['state_dict'])
+        checkpoint = torch.load(filepath, map_location=map_location)
+
+        if isinstance(self.nnet, (nn.DataParallel, DDP)):
+            self.nnet.module.load_state_dict(checkpoint['state_dict'])
+        else:
+            self.nnet.load_state_dict(checkpoint['state_dict'])
+
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        self.scaler.load_state_dict(checkpoint['scaler'])
+        self.best_val_loss = checkpoint['best_val_loss']
+        self.wait = checkpoint['wait']
+
+    def augment_examples(self, examples):
+        augmented = []
+        for board, pi, v in examples:
+            # Original example
+            augmented.append((board, pi, v))
+            
+            # Rotations
+            for k in range(1, 4):
+                rotated_board = np.rot90(board, k)
+                rotated_pi = np.rot90(pi.reshape(3, 3), k).flatten()
+                augmented.append((rotated_board, rotated_pi, v))
+            
+            # Horizontal flip
+            flipped_board = np.fliplr(board)
+            flipped_pi = np.fliplr(pi.reshape(3, 3)).flatten()
+            augmented.append((flipped_board, flipped_pi, v))
+            
+            # Vertical flip
+            flipped_board = np.flipud(board)
+            flipped_pi = np.flipud(pi.reshape(3, 3)).flatten()
+            augmented.append((flipped_board, flipped_pi, v))
+            
+        return augmented
+
+    def augment_batch(self, boards):
+        augmented = []
+        for board in boards:
+            for k in range(4):
+                rotated = torch.rot90(board, k, [1, 2])
+                augmented.append(rotated)
+                augmented.append(torch.flip(rotated, [2]))
+        return torch.stack(augmented)
+
+    def is_main_process(self):
+        return not self.args.distributed or (self.args.distributed and self.rank == 0)
+
+    def reduce_tensor(self, tensor):
+        rt = tensor.clone()
+        dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+        rt /= self.world_size
+        return rt

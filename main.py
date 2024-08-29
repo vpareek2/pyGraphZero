@@ -33,13 +33,9 @@ def run_training(rank, world_size, args):
 
     log.info('Loading %s...', args.nn_type)
     if args.nn_type == 'gat':
-        nnet = gat_nn(g)
+        nnet = gat_nn(g, args)
     else:
-        nnet = resnet_nn(g)
-
-    if args.distributed:
-        args.local_rank = rank
-        nnet.setup_distributed(args)
+        nnet = resnet_nn(g, args)
 
     if args.load_model:
         log.info('Loading checkpoint "%s/%s"...', args.load_folder_file[0], args.load_folder_file[1])
@@ -85,10 +81,14 @@ if __name__ == "__main__":
         'distributed': cli_args.distributed,
         'world_size': cli_args.world_size,
         'nn_type': cli_args.nn_type,
+        'lr': 0.001,
+        'dropout_rate': 0.3,
+        'epochs': 10,
+        'batch_size': 64,
+        'num_channels': 512,
+        'num_res_blocks': 19,
+        'l2_regularization': 1e-4,
     })
-
-# Usage: python main.py --distributed --world_size 8 --nn_type gat
-# Means 8 gpus with GAT network.
 
     if args.distributed:
         mp.spawn(run_training, args=(args.world_size, args), nprocs=args.world_size, join=True)
