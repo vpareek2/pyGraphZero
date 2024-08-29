@@ -170,18 +170,30 @@ class TicTacToeGAT(nn.Module):
         return F.log_softmax(pi, dim=1), torch.tanh(v)
 
     def _board_to_graph(self, s):
-        batch_size = s.size(0)
-        x = torch.zeros(batch_size * self.num_nodes, 3, device=s.device)
-        x[:, 0] = (s == 0).float().view(-1)
-        x[:, 1] = (s == 1).float().view(-1)
-        x[:, 2] = (s == -1).float().view(-1)
+        # Ensure s is a 4D tensor (batch_size, channels, height, width)
+        if s.dim() == 3:
+            s = s.unsqueeze(1)
+        elif s.dim() == 2:
+            s = s.unsqueeze(0).unsqueeze(0)
         
-        # Create fully connected edge index
-        edge_index = torch.combinations(torch.arange(self.num_nodes), r=2).t()
-        edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
-        edge_index = edge_index.repeat(1, batch_size)
-        batch_offset = torch.arange(batch_size, device=s.device).repeat_interleave(edge_index.size(1)) * self.num_nodes
-        edge_index = edge_index + batch_offset.unsqueeze(0)
+        batch_size, channels, height, width = s.shape
+        
+        # Reshape s to (batch_size * num_nodes, channels)
+        s_flat = s.view(batch_size, channels, -1).transpose(1, 2).contiguous().view(-1, channels)
+        
+        x = torch.zeros(batch_size * self.num_nodes, 3, device=s.device)
+        x[:, 0] = (s_flat == 0).float().sum(dim=1)
+        x[:, 1] = (s_flat == 1).float().sum(dim=1)
+        x[:, 2] = (s_flat == -1).float().sum(dim=1)
+        
+        # Create fully connected edge index for a single graph
+        edge_index_single = torch.combinations(torch.arange(self.num_nodes, device=s.device), r=2).t()
+        edge_index_single = torch.cat([edge_index_single, edge_index_single.flip(0)], dim=1)
+        
+        # Repeat the edge index for each graph in the batch
+        edge_index = edge_index_single.repeat(1, batch_size)
+        batch_offset = torch.arange(batch_size, device=s.device).repeat_interleave(edge_index_single.size(1)) * self.num_nodes
+        edge_index = edge_index + batch_offset
         
         return x, edge_index
 
@@ -214,9 +226,9 @@ class NNetWrapper:
         self.patience = 10
         self.wait = 0
 
-        if self.is_main_process():
-            wandb.init(project="tictactoe-gat", config=vars(args))
-            wandb.watch(self.nnet)
+        # if self.is_main_process():
+        #     wandb.init(project="tictactoe-gat", config=vars(args))
+        #     wandb.watch(self.nnet)
 
     def setup_distributed(self):
         self.args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -279,20 +291,25 @@ class NNetWrapper:
 
     def train_epoch(self, train_loader, epoch):
         self.nnet.train()
-        total_loss, pi_losses, v_losses = 0, 0, 0
+        total_loss = 0
+        pi_losses = 0
+        v_losses = 0
         
         for batch_idx, (boards, target_pis, target_vs) in enumerate(train_loader):
             boards, target_pis, target_vs = boards.to(self.device), target_pis.to(self.device), target_vs.to(self.device)
             
-            boards, target_pis = self.augment_batch(boards, target_pis)
-
-            with autocast():
-                out_pi, out_v = self.nnet(boards)
-                l_pi = self.criterion_pi(out_pi, target_pis)
-                l_v = self.criterion_v(out_v.squeeze(-1), target_vs)
+            # Apply data augmentation
+            augmented_boards, augmented_pis = self.augment_batch(boards, target_pis)
+            augmented_vs = target_vs.repeat(6)  # Repeat the target values for each augmentation
+            
+            self.optimizer.zero_grad()
+            
+            with autocast(device_type=self.device.type):
+                out_pi, out_v = self.nnet(augmented_boards)
+                l_pi = self.criterion_pi(out_pi, augmented_pis)
+                l_v = self.criterion_v(out_v.squeeze(-1), augmented_vs)
                 loss = l_pi + l_v
 
-            self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -316,11 +333,6 @@ class NNetWrapper:
             total_loss = self.reduce_tensor(torch.tensor(total_loss).to(self.device))
             pi_losses = self.reduce_tensor(torch.tensor(pi_losses).to(self.device))
             v_losses = self.reduce_tensor(torch.tensor(v_losses).to(self.device))
-
-        if self.is_main_process():
-            print(f'Epoch {epoch+1} Average Loss: {total_loss/len(train_loader):.3f} | '
-                  f'Pi Loss: {pi_losses/len(train_loader):.3f} | '
-                  f'V Loss: {v_losses/len(train_loader):.3f}')
 
         return total_loss, pi_losses, v_losses
 
@@ -367,10 +379,6 @@ class NNetWrapper:
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
-
-        # Ensure pi has shape (1, 10)
-        pi = pi.unsqueeze(0) if pi.dim() == 1 else pi
-        v = v.unsqueeze(0) if v.dim() == 1 else v
 
         # Move tensors to CPU and detach from computation graph
         return pi.cpu().detach(), v.cpu().detach()
@@ -423,22 +431,30 @@ class NNetWrapper:
             # Rotations
             for k in range(1, 4):
                 rotated_board = np.rot90(board, k)
-                rotated_pi = np.rot90(pi.reshape(3, 3), k).flatten()
+                rotated_pi = np.zeros_like(pi)
+                rotated_pi[:9] = np.rot90(pi[:9].reshape(3, 3), k).flatten()
+                rotated_pi[9] = pi[9]  # Keep the pass move probability unchanged
                 augmented.append((rotated_board, rotated_pi, v))
             
             # Horizontal flip
             flipped_board = np.fliplr(board)
-            flipped_pi = np.fliplr(pi.reshape(3, 3)).flatten()
+            flipped_pi = np.zeros_like(pi)
+            flipped_pi[:9] = np.fliplr(pi[:9].reshape(3, 3)).flatten()
+            flipped_pi[9] = pi[9]  # Keep the pass move probability unchanged
             augmented.append((flipped_board, flipped_pi, v))
             
             # Vertical flip
             flipped_board = np.flipud(board)
-            flipped_pi = np.flipud(pi.reshape(3, 3)).flatten()
+            flipped_pi = np.zeros_like(pi)
+            flipped_pi[:9] = np.flipud(pi[:9].reshape(3, 3)).flatten()
+            flipped_pi[9] = pi[9]  # Keep the pass move probability unchanged
             augmented.append((flipped_board, flipped_pi, v))
             
             # Diagonal flip (transpose)
             transposed_board = np.transpose(board)
-            transposed_pi = np.transpose(pi.reshape(3, 3)).flatten()
+            transposed_pi = np.zeros_like(pi)
+            transposed_pi[:9] = np.transpose(pi[:9].reshape(3, 3)).flatten()
+            transposed_pi[9] = pi[9]  # Keep the pass move probability unchanged
             augmented.append((transposed_board, transposed_pi, v))
             
             # Random noise (slight perturbation)
@@ -447,45 +463,60 @@ class NNetWrapper:
             augmented.append((noisy_board, pi, v))
             
         return augmented
-
+    
     def augment_batch(self, boards, pis):
         augmented_boards = []
         augmented_pis = []
         
         for board, pi in zip(boards, pis):
-            board_np = board.cpu().numpy()
-            pi_np = pi.cpu().numpy().reshape(3, 3)
+            board_np = board.squeeze().cpu().numpy()  # Remove the channel dimension
+            pi_np = pi.cpu().numpy()
             
-            # Random rotation
-            k = np.random.randint(0, 4)
-            if k > 0:
-                board_np = np.rot90(board_np, k)
-                pi_np = np.rot90(pi_np, k)
-            
-            # Random flip
-            if np.random.random() < 0.5:
-                if np.random.random() < 0.5:
-                    board_np = np.fliplr(board_np)
-                    pi_np = np.fliplr(pi_np)
-                else:
-                    board_np = np.flipud(board_np)
-                    pi_np = np.flipud(pi_np)
-            
-            # Random transpose
-            if np.random.random() < 0.5:
-                board_np = np.transpose(board_np)
-                pi_np = np.transpose(pi_np)
-            
-            # Random noise (slight perturbation)
-            if np.random.random() < 0.2:
-                board_np = board_np + np.random.normal(0, 0.01, board_np.shape)
-                board_np = np.clip(board_np, -1, 1)
-            
+            # Original
             augmented_boards.append(board_np)
-            augmented_pis.append(pi_np.flatten())
+            augmented_pis.append(pi_np)
+            
+            # Rotations
+            for k in range(1, 4):
+                rotated_board = np.rot90(board_np, k)
+                rotated_pi = self.rotate_policy(pi_np, k)
+                augmented_boards.append(rotated_board)
+                augmented_pis.append(rotated_pi)
+            
+            # Horizontal flip
+            flipped_board_h = np.fliplr(board_np)
+            flipped_pi_h = self.flip_policy(pi_np, 'horizontal')
+            augmented_boards.append(flipped_board_h)
+            augmented_pis.append(flipped_pi_h)
+            
+            # Vertical flip
+            flipped_board_v = np.flipud(board_np)
+            flipped_pi_v = self.flip_policy(pi_np, 'vertical')
+            augmented_boards.append(flipped_board_v)
+            augmented_pis.append(flipped_pi_v)
         
-        return (torch.FloatTensor(np.array(augmented_boards)).to(self.device),
+        return (torch.FloatTensor(np.array(augmented_boards)).unsqueeze(1).to(self.device),
                 torch.FloatTensor(np.array(augmented_pis)).to(self.device))
+
+
+    def rotate_policy(self, pi, k):
+        pi_board = pi[:9].reshape(3, 3)
+        pi_board = np.rot90(pi_board, k)
+        rotated_pi = np.zeros_like(pi)
+        rotated_pi[:9] = pi_board.flatten()
+        rotated_pi[9] = pi[9]  # Keep the pass move probability unchanged
+        return rotated_pi
+
+    def flip_policy(self, pi, direction):
+        pi_board = pi[:9].reshape(3, 3)
+        if direction == 'horizontal':
+            pi_board = np.fliplr(pi_board)
+        elif direction == 'vertical':
+            pi_board = np.flipud(pi_board)
+        flipped_pi = np.zeros_like(pi)
+        flipped_pi[:9] = pi_board.flatten()
+        flipped_pi[9] = pi[9]  # Keep the pass move probability unchanged
+        return flipped_pi
 
     def is_main_process(self):
         return not self.args.distributed or (self.args.distributed and self.rank == 0)
