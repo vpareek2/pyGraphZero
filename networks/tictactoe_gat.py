@@ -1,5 +1,4 @@
 import os
-import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,6 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
+import wandb
 
 class GATLayer(nn.Module):
     def __init__(self, in_features, out_features, num_heads, concat=True, activation=nn.ELU(),
@@ -214,6 +214,10 @@ class NNetWrapper:
         self.patience = 10
         self.wait = 0
 
+        if self.is_main_process():
+            wandb.init(project="tictactoe-gat", config=vars(args))
+            wandb.watch(self.nnet)
+
     def setup_distributed(self):
         self.args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.device = torch.device(f"cuda:{self.args.local_rank}")
@@ -242,12 +246,21 @@ class NNetWrapper:
             if self.args.distributed:
                 train_sampler.set_epoch(epoch)
             
-            self.train_epoch(train_loader, epoch)
+            total_loss, pi_losses, v_losses = self.train_epoch(train_loader, epoch)
             val_loss = self.validate(val_examples)
             
             if self.is_main_process():
                 print(f'Epoch {epoch+1}/{self.args.epochs}')
                 print(f'Validation Loss: {val_loss:.3f}')
+                
+                wandb.log({
+                    "epoch": epoch,
+                    "train_loss": total_loss / len(train_loader),
+                    "train_pi_loss": pi_losses / len(train_loader),
+                    "train_v_loss": v_losses / len(train_loader),
+                    "val_loss": val_loss,
+                    "learning_rate": self.optimizer.param_groups[0]['lr']
+                })
                 
                 self.scheduler.step(val_loss)
 
@@ -291,6 +304,13 @@ class NNetWrapper:
             if batch_idx % 100 == 0 and self.is_main_process():
                 print(f'Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)}, '
                       f'Loss: {loss.item():.3f}, Pi Loss: {l_pi.item():.3f}, V Loss: {l_v.item():.3f}')
+                
+                wandb.log({
+                    "batch": batch_idx + epoch * len(train_loader),
+                    "batch_loss": loss.item(),
+                    "batch_pi_loss": l_pi.item(),
+                    "batch_v_loss": l_v.item()
+                })
 
         if self.args.distributed:
             total_loss = self.reduce_tensor(torch.tensor(total_loss).to(self.device))
@@ -301,6 +321,8 @@ class NNetWrapper:
             print(f'Epoch {epoch+1} Average Loss: {total_loss/len(train_loader):.3f} | '
                   f'Pi Loss: {pi_losses/len(train_loader):.3f} | '
                   f'V Loss: {v_losses/len(train_loader):.3f}')
+
+        return total_loss, pi_losses, v_losses
 
     def validate(self, val_examples):
         self.nnet.eval()
@@ -369,6 +391,9 @@ class NNetWrapper:
             'best_val_loss': self.best_val_loss,
             'wait': self.wait,
         }, filepath)
+
+        if self.is_main_process():
+            wandb.save(filepath)
 
     def load_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
         filepath = os.path.join(folder, filename)
