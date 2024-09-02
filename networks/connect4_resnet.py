@@ -230,8 +230,9 @@ class NNetWrapper:
 
     def get_symmetries(self, board, pi, v):
         symmetries = []
+        board_height, board_width = self.game.get_board_size()
         # Vertical flip
-        symmetries.append((np.flipud(board), np.flipud(pi.reshape(self.game.n, self.game.n)).flatten(), v))
+        symmetries.append((np.flipud(board), np.flipud(pi), v))
         # Original
         symmetries.append((board, pi, v))
         return symmetries
