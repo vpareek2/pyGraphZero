@@ -136,7 +136,7 @@ class NNetWrapper:
             with autocast('cuda'):
                 out_pi, out_v = self.nnet(boards)
                 loss_pi = self.criterion_pi(out_pi, target_pis)
-                loss_v = self.criterion_v(out_v, target_vs)
+                loss_v = self.criterion_v(out_v, target_vs.squeeze())
                 loss = loss_pi + loss_v
 
             self.scaler.scale(loss).backward()
@@ -150,18 +150,22 @@ class NNetWrapper:
     def validate(self, val_data):
         self.nnet.eval()
         val_loss = 0
-        boards, target_pis, target_vs = self.to_device(*val_data)
+        val_loader = DataLoader(val_data, batch_size=self.args.batch_size, shuffle=False)
 
         with torch.no_grad():
-            out_pi, out_v = self.nnet(boards)
-            loss_pi = self.criterion_pi(out_pi, target_pis)
-            loss_v = self.criterion_v(out_v, target_vs)
-            val_loss = loss_pi + loss_v
+            for boards, target_pis, target_vs in val_loader:
+                boards, target_pis, target_vs = self.to_device(boards, target_pis, target_vs)
+                out_pi, out_v = self.nnet(boards)
+                loss_pi = self.criterion_pi(out_pi, target_pis)
+                loss_v = self.criterion_v(out_v, target_vs.squeeze())
+                val_loss += (loss_pi + loss_v).item()
+
+        val_loss /= len(val_loader)
 
         if self.args.distributed:
-            val_loss = self.reduce_tensor(val_loss)
+            val_loss = self.reduce_tensor(torch.tensor(val_loss, device=self.device)).item()
 
-        return val_loss.item()
+        return val_loss
 
     def predict(self, board):
         board = self.preprocess_board(board)
