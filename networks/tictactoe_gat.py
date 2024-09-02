@@ -1,16 +1,6 @@
-import os
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
-from sklearn.model_selection import train_test_split
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.amp import autocast, GradScaler
-import wandb
 
 class GATLayer(nn.Module):
     def __init__(self, in_features, out_features, num_heads, concat=True, activation=nn.ELU(),
@@ -21,12 +11,11 @@ class GATLayer(nn.Module):
         self.num_heads = num_heads
         self.concat = concat
         self.activation = activation
-        self.dropout_prob = dropout_prob
         self.add_skip_connection = add_skip_connection
         
         self.linear_proj = nn.Linear(in_features, num_heads * out_features, bias=False)
-        self.scoring_fn_source = nn.Parameter(torch.Tensor(1, num_heads, out_features))
         self.scoring_fn_target = nn.Parameter(torch.Tensor(1, num_heads, out_features))
+        self.scoring_fn_source = nn.Parameter(torch.Tensor(1, num_heads, out_features))
         
         if bias and concat:
             self.bias = nn.Parameter(torch.Tensor(num_heads * out_features))
@@ -53,39 +42,39 @@ class GATLayer(nn.Module):
         if self.bias is not None:
             torch.nn.init.zeros_(self.bias)
 
-    def forward(self, node_features, edge_index):
-        num_nodes = node_features.size(0)
+    def forward(self, x, edge_index):
+        num_nodes = x.size(0)
 
         # Linear projection and regularization
-        node_features = self.dropout(node_features)
-        nodes_features_proj = self.linear_proj(node_features).view(-1, self.num_heads, self.out_features)
-        nodes_features_proj = self.dropout(nodes_features_proj)
+        x = self.dropout(x)
+        x = self.linear_proj(x).view(-1, self.num_heads, self.out_features)
+        x = self.dropout(x)
 
         # Edge attention calculation
-        scores_source = (nodes_features_proj * self.scoring_fn_source).sum(dim=-1)
-        scores_target = (nodes_features_proj * self.scoring_fn_target).sum(dim=-1)
-        scores_source_lifted, scores_target_lifted, nodes_features_proj_lifted = self.lift(scores_source, scores_target, nodes_features_proj, edge_index)
+        scores_source = (x * self.scoring_fn_source).sum(dim=-1)
+        scores_target = (x * self.scoring_fn_target).sum(dim=-1)
+        scores_source_lifted, scores_target_lifted, x_lifted = self.lift(scores_source, scores_target, x, edge_index)
         scores_per_edge = self.leakyReLU(scores_source_lifted + scores_target_lifted)
         
         attentions_per_edge = self.neighborhood_aware_softmax(scores_per_edge, edge_index[1], num_nodes)
         attentions_per_edge = self.dropout(attentions_per_edge)
 
         # Neighborhood aggregation
-        nodes_features_proj_lifted_weighted = nodes_features_proj_lifted * attentions_per_edge
-        out_nodes_features = self.aggregate_neighbors(nodes_features_proj_lifted_weighted, edge_index, node_features, num_nodes)
+        x_lifted_weighted = x_lifted * attentions_per_edge
+        out_nodes_features = self.aggregate_neighbors(x_lifted_weighted, edge_index, num_nodes)
 
         # Skip connection and bias
-        out_nodes_features = self.skip_concat_bias(node_features, out_nodes_features)
+        out_nodes_features = self.skip_concat_bias(x, out_nodes_features)
 
         return out_nodes_features if self.activation is None else self.activation(out_nodes_features)
 
-    def lift(self, scores_source, scores_target, nodes_features_matrix_proj, edge_index):
+    def lift(self, scores_source, scores_target, x, edge_index):
         src_nodes_index = edge_index[0]
         trg_nodes_index = edge_index[1]
         scores_source = scores_source.index_select(0, src_nodes_index)
         scores_target = scores_target.index_select(0, trg_nodes_index)
-        nodes_features_matrix_proj_lifted = nodes_features_matrix_proj.index_select(0, src_nodes_index)
-        return scores_source, scores_target, nodes_features_matrix_proj_lifted
+        x_lifted = x.index_select(0, src_nodes_index)
+        return scores_source, scores_target, x_lifted
 
     def neighborhood_aware_softmax(self, scores_per_edge, trg_index, num_of_nodes):
         scores_per_edge = scores_per_edge - scores_per_edge.max()
@@ -102,20 +91,20 @@ class GATLayer(nn.Module):
         neighborhood_sums.scatter_add_(0, trg_index_broadcasted, exp_scores_per_edge)
         return neighborhood_sums.index_select(0, trg_index)
 
-    def aggregate_neighbors(self, nodes_features_proj_lifted_weighted, edge_index, in_nodes_features, num_of_nodes):
-        size = list(nodes_features_proj_lifted_weighted.shape)
+    def aggregate_neighbors(self, x_lifted_weighted, edge_index, num_of_nodes):
+        trg_index_broadcasted = self.explicit_broadcast(edge_index[1], x_lifted_weighted)
+        size = list(x_lifted_weighted.shape)
         size[0] = num_of_nodes
-        out_nodes_features = torch.zeros(size, dtype=in_nodes_features.dtype, device=in_nodes_features.device)
-        trg_index_broadcasted = self.explicit_broadcast(edge_index[1], nodes_features_proj_lifted_weighted)
-        out_nodes_features.scatter_add_(0, trg_index_broadcasted, nodes_features_proj_lifted_weighted)
+        out_nodes_features = torch.zeros(size, dtype=x_lifted_weighted.dtype, device=x_lifted_weighted.device)
+        out_nodes_features.scatter_add_(0, trg_index_broadcasted, x_lifted_weighted)
         return out_nodes_features
 
-    def skip_concat_bias(self, in_nodes_features, out_nodes_features):
+    def skip_concat_bias(self, x, out_nodes_features):
         if self.add_skip_connection:
-            if out_nodes_features.shape[-1] == in_nodes_features.shape[-1]:
-                out_nodes_features += in_nodes_features.unsqueeze(1)
+            if out_nodes_features.shape[-1] == x.shape[-1]:
+                out_nodes_features += x.unsqueeze(1)
             else:
-                out_nodes_features += self.skip_proj(in_nodes_features).view(-1, self.num_heads, self.out_features)
+                out_nodes_features += self.skip_proj(x).view(-1, self.num_heads, self.out_features)
 
         if self.concat:
             out_nodes_features = out_nodes_features.view(-1, self.num_heads * self.out_features)
@@ -131,7 +120,6 @@ class GATLayer(nn.Module):
         for _ in range(this.dim(), other.dim()):
             this = this.unsqueeze(-1)
         return this.expand_as(other)
-
 
 class TicTacToeGAT(nn.Module):
     def __init__(self, game, args):
@@ -196,333 +184,3 @@ class TicTacToeGAT(nn.Module):
         edge_index = edge_index + batch_offset
         
         return x, edge_index
-
-class NNetWrapper:
-    def __init__(self, game, args):
-        self.game = game
-        self.args = args
-        self.board_x, self.board_y = game.get_board_size()
-        self.action_size = game.get_action_size()
-
-        if args.distributed:
-            self.setup_distributed()
-        else:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.nnet = TicTacToeGAT(game, args).to(self.device)
-
-        if args.distributed:
-            self.nnet = DDP(self.nnet, device_ids=[self.args.local_rank], output_device=self.args.local_rank)
-        elif torch.cuda.device_count() > 1:
-            self.nnet = nn.DataParallel(self.nnet)
-
-        self.optimizer = optim.Adam(self.nnet.parameters(), lr=args.lr, weight_decay=args.l2_regularization)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5)
-        self.scaler = GradScaler()
-        self.criterion_pi = nn.CrossEntropyLoss()
-        self.criterion_v = nn.MSELoss()
-
-        self.best_val_loss = float('inf')
-        self.patience = 10
-        self.wait = 0
-
-        # if self.is_main_process():
-        #     wandb.init(project="tictactoe-gat", config=vars(args))
-        #     wandb.watch(self.nnet)
-
-    def setup_distributed(self):
-        self.args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.device = torch.device(f"cuda:{self.args.local_rank}")
-        torch.cuda.set_device(self.device)
-        dist.init_process_group(backend='nccl')
-        self.world_size = dist.get_world_size()
-        self.rank = dist.get_rank()
-
-    def train(self, examples):
-        augmented_examples = self.augment_examples(examples)
-        train_examples, val_examples = train_test_split(augmented_examples, test_size=0.2)
-
-        train_data = TensorDataset(
-            torch.FloatTensor([ex[0] for ex in train_examples]),
-            torch.FloatTensor([ex[1] for ex in train_examples]),
-            torch.FloatTensor([ex[2] for ex in train_examples])
-        )
-        
-        if self.args.distributed:
-            train_sampler = DistributedSampler(train_data, num_replicas=self.world_size, rank=self.rank)
-            train_loader = DataLoader(train_data, batch_size=self.args.batch_size, sampler=train_sampler)
-        else:
-            train_loader = DataLoader(train_data, batch_size=self.args.batch_size, shuffle=True)
-
-        for epoch in range(self.args.epochs):
-            if self.args.distributed:
-                train_sampler.set_epoch(epoch)
-            
-            total_loss, pi_losses, v_losses = self.train_epoch(train_loader, epoch)
-            val_loss = self.validate(val_examples)
-            
-            if self.is_main_process():
-                print(f'Epoch {epoch+1}/{self.args.epochs}')
-                print(f'Validation Loss: {val_loss:.3f}')
-                
-                wandb.log({
-                    "epoch": epoch,
-                    "train_loss": total_loss / len(train_loader),
-                    "train_pi_loss": pi_losses / len(train_loader),
-                    "train_v_loss": v_losses / len(train_loader),
-                    "val_loss": val_loss,
-                    "learning_rate": self.optimizer.param_groups[0]['lr']
-                })
-                
-                self.scheduler.step(val_loss)
-
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self.wait = 0
-                    self.save_checkpoint()
-                else:
-                    self.wait += 1
-                    if self.wait >= self.patience:
-                        print("Early stopping")
-                        break
-
-            if self.args.distributed:
-                dist.barrier()
-
-    def train_epoch(self, train_loader, epoch):
-        self.nnet.train()
-        total_loss = 0
-        pi_losses = 0
-        v_losses = 0
-        
-        for batch_idx, (boards, target_pis, target_vs) in enumerate(train_loader):
-            boards, target_pis, target_vs = boards.to(self.device), target_pis.to(self.device), target_vs.to(self.device)
-            
-            # Apply data augmentation
-            augmented_boards, augmented_pis = self.augment_batch(boards, target_pis)
-            augmented_vs = target_vs.repeat(6)  # Repeat the target values for each augmentation
-            
-            self.optimizer.zero_grad()
-            
-            with autocast(device_type=self.device.type):
-                out_pi, out_v = self.nnet(augmented_boards)
-                l_pi = self.criterion_pi(out_pi, augmented_pis)
-                l_v = self.criterion_v(out_v.squeeze(-1), augmented_vs)
-                loss = l_pi + l_v
-
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            total_loss += loss.item()
-            pi_losses += l_pi.item()
-            v_losses += l_v.item()
-
-            if batch_idx % 100 == 0 and self.is_main_process():
-                print(f'Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)}, '
-                      f'Loss: {loss.item():.3f}, Pi Loss: {l_pi.item():.3f}, V Loss: {l_v.item():.3f}')
-                
-                wandb.log({
-                    "batch": batch_idx + epoch * len(train_loader),
-                    "batch_loss": loss.item(),
-                    "batch_pi_loss": l_pi.item(),
-                    "batch_v_loss": l_v.item()
-                })
-
-        if self.args.distributed:
-            total_loss = self.reduce_tensor(torch.tensor(total_loss).to(self.device))
-            pi_losses = self.reduce_tensor(torch.tensor(pi_losses).to(self.device))
-            v_losses = self.reduce_tensor(torch.tensor(v_losses).to(self.device))
-
-        return total_loss, pi_losses, v_losses
-
-    def validate(self, val_examples):
-        self.nnet.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for board, target_pi, target_v in val_examples:
-                board = torch.FloatTensor(board.astype(np.float64)).unsqueeze(0).to(self.device)
-                target_pi = torch.FloatTensor(target_pi).unsqueeze(0).to(self.device)
-                target_v = torch.FloatTensor([target_v]).to(self.device)
-                
-                out_pi, out_v = self.nnet(board)
-                l_pi = self.criterion_pi(out_pi, target_pi)
-                l_v = self.criterion_v(out_v.squeeze(-1), target_v)
-                val_loss += (l_pi + l_v).item()
-
-        if self.args.distributed:
-            val_loss = self.reduce_tensor(torch.tensor(val_loss).to(self.device))
-
-        return val_loss / len(val_examples)
-
-    def predict(self, board):
-        """
-        board: np array with board
-        """
-        # Input validation
-        if not isinstance(board, np.ndarray):
-            raise ValueError(f"Invalid input type. Expected numpy array, got {type(board)}")
-        if board.shape != (3, 3):
-            raise ValueError(f"Invalid board shape. Expected (3, 3), got {board.shape}")
-        if not np.issubdtype(board.dtype, np.number):
-            raise ValueError(f"Invalid board data type. Expected numeric type, got {board.dtype}")
-        if not np.all(np.isin(board, [-1, 0, 1])):
-            raise ValueError("Invalid board values. Expected only -1, 0, or 1")
-
-        # Prepare input
-        board = torch.FloatTensor(board.astype(np.float64))
-        board = board.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
-        
-        # Move the input tensor to the same device as the model
-        board = board.to(self.device)
-        
-        self.nnet.eval()
-        with torch.no_grad():
-            pi, v = self.nnet(board)
-
-        # Move tensors to CPU and detach from computation graph
-        return pi.cpu().detach(), v.cpu().detach()
-
-    def save_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
-        if not self.is_main_process():
-            return
-
-        filepath = os.path.join(folder, filename)
-        if not os.path.exists(folder):
-            os.makedirs(folder)
-
-        torch.save({
-            'state_dict': self.nnet.module.state_dict() if isinstance(self.nnet, (nn.DataParallel, DDP)) else self.nnet.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'scaler': self.scaler.state_dict(),
-            'best_val_loss': self.best_val_loss,
-            'wait': self.wait,
-        }, filepath)
-
-        if self.is_main_process():
-            wandb.save(filepath)
-
-    def load_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
-        filepath = os.path.join(folder, filename)
-        if not os.path.exists(filepath):
-            raise ValueError(f"No model in path '{filepath}'")
-
-        map_location = {'cuda:%d' % 0: 'cuda:%d' % self.args.local_rank} if self.args.distributed else self.device
-        checkpoint = torch.load(filepath, map_location=map_location)
-
-        if isinstance(self.nnet, (nn.DataParallel, DDP)):
-            self.nnet.module.load_state_dict(checkpoint['state_dict'])
-        else:
-            self.nnet.load_state_dict(checkpoint['state_dict'])
-
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
-        self.scaler.load_state_dict(checkpoint['scaler'])
-        self.best_val_loss = checkpoint['best_val_loss']
-        self.wait = checkpoint['wait']
-
-    def augment_examples(self, examples):
-        augmented = []
-        for board, pi, v in examples:
-            # Original example
-            augmented.append((board, pi, v))
-            
-            # Rotations
-            for k in range(1, 4):
-                rotated_board = np.rot90(board, k)
-                rotated_pi = np.zeros_like(pi)
-                rotated_pi[:9] = np.rot90(pi[:9].reshape(3, 3), k).flatten()
-                rotated_pi[9] = pi[9]  # Keep the pass move probability unchanged
-                augmented.append((rotated_board, rotated_pi, v))
-            
-            # Horizontal flip
-            flipped_board = np.fliplr(board)
-            flipped_pi = np.zeros_like(pi)
-            flipped_pi[:9] = np.fliplr(pi[:9].reshape(3, 3)).flatten()
-            flipped_pi[9] = pi[9]  # Keep the pass move probability unchanged
-            augmented.append((flipped_board, flipped_pi, v))
-            
-            # Vertical flip
-            flipped_board = np.flipud(board)
-            flipped_pi = np.zeros_like(pi)
-            flipped_pi[:9] = np.flipud(pi[:9].reshape(3, 3)).flatten()
-            flipped_pi[9] = pi[9]  # Keep the pass move probability unchanged
-            augmented.append((flipped_board, flipped_pi, v))
-            
-            # Diagonal flip (transpose)
-            transposed_board = np.transpose(board)
-            transposed_pi = np.zeros_like(pi)
-            transposed_pi[:9] = np.transpose(pi[:9].reshape(3, 3)).flatten()
-            transposed_pi[9] = pi[9]  # Keep the pass move probability unchanged
-            augmented.append((transposed_board, transposed_pi, v))
-            
-            # Random noise (slight perturbation)
-            noisy_board = board + np.random.normal(0, 0.01, board.shape)
-            noisy_board = np.clip(noisy_board, -1, 1)
-            augmented.append((noisy_board, pi, v))
-            
-        return augmented
-    
-    def augment_batch(self, boards, pis):
-        augmented_boards = []
-        augmented_pis = []
-        
-        for board, pi in zip(boards, pis):
-            board_np = board.squeeze().cpu().numpy()  # Remove the channel dimension
-            pi_np = pi.cpu().numpy()
-            
-            # Original
-            augmented_boards.append(board_np)
-            augmented_pis.append(pi_np)
-            
-            # Rotations
-            for k in range(1, 4):
-                rotated_board = np.rot90(board_np, k)
-                rotated_pi = self.rotate_policy(pi_np, k)
-                augmented_boards.append(rotated_board)
-                augmented_pis.append(rotated_pi)
-            
-            # Horizontal flip
-            flipped_board_h = np.fliplr(board_np)
-            flipped_pi_h = self.flip_policy(pi_np, 'horizontal')
-            augmented_boards.append(flipped_board_h)
-            augmented_pis.append(flipped_pi_h)
-            
-            # Vertical flip
-            flipped_board_v = np.flipud(board_np)
-            flipped_pi_v = self.flip_policy(pi_np, 'vertical')
-            augmented_boards.append(flipped_board_v)
-            augmented_pis.append(flipped_pi_v)
-        
-        return (torch.FloatTensor(np.array(augmented_boards)).unsqueeze(1).to(self.device),
-                torch.FloatTensor(np.array(augmented_pis)).to(self.device))
-
-
-    def rotate_policy(self, pi, k):
-        pi_board = pi[:9].reshape(3, 3)
-        pi_board = np.rot90(pi_board, k)
-        rotated_pi = np.zeros_like(pi)
-        rotated_pi[:9] = pi_board.flatten()
-        rotated_pi[9] = pi[9]  # Keep the pass move probability unchanged
-        return rotated_pi
-
-    def flip_policy(self, pi, direction):
-        pi_board = pi[:9].reshape(3, 3)
-        if direction == 'horizontal':
-            pi_board = np.fliplr(pi_board)
-        elif direction == 'vertical':
-            pi_board = np.flipud(pi_board)
-        flipped_pi = np.zeros_like(pi)
-        flipped_pi[:9] = pi_board.flatten()
-        flipped_pi[9] = pi[9]  # Keep the pass move probability unchanged
-        return flipped_pi
-
-    def is_main_process(self):
-        return not self.args.distributed or (self.args.distributed and self.rank == 0)
-
-    def reduce_tensor(self, tensor):
-        rt = tensor.clone()
-        dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-        rt /= self.world_size
-        return rt
