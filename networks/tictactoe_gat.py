@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.amp import autocast, GradScaler
 import numpy as np
+import os
 
 class GATLayer(nn.Module):
     def __init__(self, in_features, out_features, num_heads, concat=True, activation=nn.ELU(),
