@@ -51,11 +51,13 @@ class GATLayer(nn.Module):
             torch.nn.init.zeros_(self.bias)
 
     def forward(self, x, edge_index):
+        print(f"GATLayer input - x shape: {x.shape}, edge_index shape: {edge_index.shape}")
+
         num_nodes = x.size(0)
 
         # Linear projection and regularization
         x = self.dropout(x)
-        x = self.linear_proj(x).view(-1, self.num_heads, self.out_features)
+        x = self.linear_proj(x).view(num_nodes, self.num_heads, self.out_features)
         x = self.dropout(x)
 
         # Edge attention calculation
@@ -73,6 +75,7 @@ class GATLayer(nn.Module):
 
         # Skip connection and bias
         out_nodes_features = self.skip_concat_bias(x, out_nodes_features)
+        print(f"GATLayer output - shape: {out_nodes_features.shape}")
 
         return out_nodes_features if self.activation is None else self.activation(out_nodes_features)
 
@@ -110,14 +113,14 @@ class GATLayer(nn.Module):
     def skip_concat_bias(self, x, out_nodes_features):
         if self.add_skip_connection:
             if out_nodes_features.shape[-1] == x.shape[-1]:
-                out_nodes_features += x.unsqueeze(1)
+                out_nodes_features += x.view(*out_nodes_features.shape)
             else:
-                out_nodes_features += self.skip_proj(x).view(-1, self.num_heads, self.out_features)
+                out_nodes_features += self.skip_proj(x).view(*out_nodes_features.shape)
 
         if self.concat:
             out_nodes_features = out_nodes_features.view(-1, self.num_heads * self.out_features)
         else:
-            out_nodes_features = out_nodes_features.mean(dim=1)
+            out_nodes_features = out_nodes_features.mean(dim=-2)
 
         if self.bias is not None:
             out_nodes_features += self.bias
@@ -139,52 +142,65 @@ class TicTacToeGAT(nn.Module):
         self.num_nodes = self.board_x * self.board_y
         self.num_features = 3  # empty, X, O
 
-        self.gat1 = GATLayer(self.num_features, args.num_channels, num_heads=4, dropout_prob=0.3)
-        self.gat2 = GATLayer(args.num_channels * 4, args.num_channels, num_heads=4, dropout_prob=0.3)
+        self.gat1 = GATLayer(self.num_features, args.num_channels, num_heads=args.num_heads, dropout_prob=args.dropout_rate)
+        self.gat2 = GATLayer(args.num_channels * args.num_heads, args.num_channels, num_heads=args.num_heads, dropout_prob=args.dropout_rate)
         
-        self.fc1 = nn.Linear(args.num_channels * 4 * self.num_nodes, 256)
+        self.fc1 = nn.Linear(args.num_channels * args.num_heads * self.num_nodes, 256)
         self.fc2 = nn.Linear(256, 128)
         
         self.fc_policy = nn.Linear(128, self.action_size)
         self.fc_value = nn.Linear(128, 1)
 
     def forward(self, s):
+        print(f"TicTacToeGAT forward - input shape: {s.shape}")
         x, edge_index = self._board_to_graph(s)
+        print(f"After _board_to_graph - x shape: {x.shape}, edge_index shape: {edge_index.shape}")
         
+        # GAT layers
         x = self.gat1(x, edge_index)
+        print(f"After gat1 - x shape: {x.shape}")
         x = F.elu(x)
         x = self.gat2(x, edge_index)
+        print(f"After gat2 - x shape: {x.shape}")
         x = F.elu(x)
-
-        x = x.view(-1, self.args.num_channels * 4 * self.num_nodes)
+        
+        # Reshape x to (batch_size, nodes * features)
+        batch_size = s.size(0)
+        x = x.view(batch_size, -1)
+        print(f"After reshaping - x shape: {x.shape}")
+        
+        # FC layers
         x = F.relu(self.fc1(x))
+        print(f"After fc1 - x shape: {x.shape}")
         x = F.relu(self.fc2(x))
-
+        print(f"After fc2 - x shape: {x.shape}")
+        
         pi = self.fc_policy(x)
         v = self.fc_value(x)
-
+        
+        print(f"Output - pi shape: {pi.shape}, v shape: {v.shape}")
+        
         return F.log_softmax(pi, dim=1), torch.tanh(v)
 
     def _board_to_graph(self, s):
-        # Ensure s is a 4D tensor (batch_size, channels, height, width)
+        print(f"_board_to_graph input shape: {s.shape}")
+        # Ensure s is a 4D tensor (batch_size, 3, 3, 3)
         if s.dim() == 3:
-            s = s.unsqueeze(1)
-        elif s.dim() == 2:
-            s = s.unsqueeze(0).unsqueeze(0)
+            s = s.unsqueeze(0)
         
         batch_size, channels, height, width = s.shape
+        assert channels == 3 and height == 3 and width == 3, "Input should be (batch_size, 3, 3, 3)"
         
-        # Reshape s to (batch_size * num_nodes, channels)
-        s_flat = s.view(batch_size, channels, -1).transpose(1, 2).contiguous().view(-1, channels)
-        
-        x = torch.zeros(batch_size * self.num_nodes, 3, device=s.device)
-        x[:, 0] = (s_flat == 0).float().sum(dim=1)
-        x[:, 1] = (s_flat == 1).float().sum(dim=1)
-        x[:, 2] = (s_flat == -1).float().sum(dim=1)
+        # Reshape s to (batch_size * num_nodes, 3)
+        x = s.view(batch_size * self.num_nodes, 3)
         
         # Create fully connected edge index for a single graph
-        edge_index_single = torch.combinations(torch.arange(self.num_nodes, device=s.device), r=2).t()
-        edge_index_single = torch.cat([edge_index_single, edge_index_single.flip(0)], dim=1)
+        edge_index_single = []
+        for i in range(self.num_nodes):
+            for j in range(self.num_nodes):
+                if i != j:
+                    edge_index_single.append([i, j])
+        edge_index_single = torch.tensor(edge_index_single, device=s.device).t()
         
         # Repeat the edge index for each graph in the batch
         edge_index = edge_index_single.repeat(1, batch_size)
@@ -216,6 +232,7 @@ class NNetWrapper:
         self.criterion_v = nn.MSELoss()
 
     def train(self, examples):
+        print("Starting training...")
         train_examples, val_examples = train_test_split(examples, test_size=0.2)
 
         train_data = TensorDataset(
@@ -227,9 +244,11 @@ class NNetWrapper:
         train_loader = DataLoader(train_data, batch_size=self.args.batch_size, shuffle=True)
 
         for epoch in range(self.args.epochs):
+            print(f"Epoch {epoch+1}/{self.args.epochs}")
             self.nnet.train()
             total_loss = 0
             for batch_idx, (boards, target_pis, target_vs) in enumerate(train_loader):
+                print(f"Batch {batch_idx+1} - Input shape: {boards.shape}")
                 boards, target_pis, target_vs = boards.to(self.device), target_pis.to(self.device), target_vs.to(self.device)
                 
                 self.optimizer.zero_grad()
@@ -268,14 +287,20 @@ class NNetWrapper:
         return val_loss / len(val_examples)
 
     def predict(self, board):
+        print(f"NNetWrapper predict - input board shape: {board.shape}")
         board = torch.FloatTensor(board.astype(np.float64))
-        board = board.unsqueeze(0).unsqueeze(0).to(self.device)
+        if board.dim() == 3:
+            board = board.unsqueeze(0)
+        board = board.to(self.device)
+        print(f"NNetWrapper predict - processed board shape: {board.shape}")
         
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
 
-        return pi.exp().cpu().numpy()[0], v.cpu().numpy()[0]
+        print(f"NNetWrapper predict - output pi shape: {pi.shape}, v shape: {v.shape}")
+        return pi.exp().cpu().numpy()[0], v.cpu().numpy()[0].item() 
+
 
     def save_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
         filepath = os.path.join(folder, filename)
@@ -287,14 +312,15 @@ class NNetWrapper:
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'scaler': self.scaler.state_dict(),
-        }, filepath)
+        }, filepath, _use_new_zipfile_serialization=True)
 
     def load_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
         filepath = os.path.join(folder, filename)
         if not os.path.exists(filepath):
             raise ValueError(f"No model in path '{filepath}'")
 
-        checkpoint = torch.load(filepath, map_location=self.device)
+        # Use weights_only=True to avoid potential security issues
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=True)
 
         self.nnet.load_state_dict(checkpoint['state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -308,15 +334,11 @@ class NNetWrapper:
             
             for k in range(1, 4):
                 rotated_board = np.rot90(board, k)
-                rotated_pi = np.zeros_like(pi)
-                rotated_pi[:9] = np.rot90(pi[:9].reshape(3, 3), k).flatten()
-                rotated_pi[9] = pi[9]
+                rotated_pi = np.rot90(pi.reshape(3, 3), k).flatten()
                 augmented.append((rotated_board, rotated_pi, v))
             
             flipped_board = np.fliplr(board)
-            flipped_pi = np.zeros_like(pi)
-            flipped_pi[:9] = np.fliplr(pi[:9].reshape(3, 3)).flatten()
-            flipped_pi[9] = pi[9]
+            flipped_pi = np.fliplr(pi.reshape(3, 3)).flatten()
             augmented.append((flipped_board, flipped_pi, v))
             
         return augmented
