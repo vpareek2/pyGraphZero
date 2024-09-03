@@ -330,4 +330,3 @@ class NNetWrapper:
             augmented.append((flipped_board, flipped_pi, v))
         
         return augmented
-    
