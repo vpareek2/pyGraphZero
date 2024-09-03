@@ -17,7 +17,7 @@ from mcts import MCTS
 
 log = logging.getLogger(__name__)
 
-class Coach():
+class SelfPlay():
     def __init__(self, game, nnet, args):
         self.game = game
         self.args = args

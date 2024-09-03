@@ -4,7 +4,7 @@ import os
 import argparse
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from self_play import Coach
+from self_play import SelfPlay
 from games.tictactoe import TicTacToeGame
 from networks.tictactoe_resnet import NNetWrapper as resnet_nn
 from networks.tictactoe_gat import NNetWrapper as gat_nn
@@ -43,8 +43,8 @@ def run_training(rank, world_size, args):
     else:
         log.warning('Not loading a checkpoint!')
 
-    log.info('Loading the Coach...')
-    c = Coach(g, nnet, args)
+    log.info('Loading Self Play...')
+    c = SelfPlay(g, nnet, args)
 
     if args.load_model:
         log.info("Loading 'trainExamples' from file...")
