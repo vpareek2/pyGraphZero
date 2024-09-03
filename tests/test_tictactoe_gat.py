@@ -110,7 +110,5 @@ class TestTicTacToeGAT(unittest.TestCase):
         self.assertGreaterEqual(v, -1.0)
         self.assertLessEqual(v, 1.0)
         
-        print(f"Untrained model - Policy: {pi}, Value: {v}")
-
 if __name__ == '__main__':
     unittest.main()

@@ -51,7 +51,6 @@ class GATLayer(nn.Module):
             torch.nn.init.zeros_(self.bias)
 
     def forward(self, x, edge_index):
-        print(f"GATLayer input - x shape: {x.shape}, edge_index shape: {edge_index.shape}")
 
         num_nodes = x.size(0)
 
@@ -75,7 +74,6 @@ class GATLayer(nn.Module):
 
         # Skip connection and bias
         out_nodes_features = self.skip_concat_bias(x, out_nodes_features)
-        print(f"GATLayer output - shape: {out_nodes_features.shape}")
 
         return out_nodes_features if self.activation is None else self.activation(out_nodes_features)
 
@@ -152,38 +150,29 @@ class TicTacToeGAT(nn.Module):
         self.fc_value = nn.Linear(128, 1)
 
     def forward(self, s):
-        print(f"TicTacToeGAT forward - input shape: {s.shape}")
         x, edge_index = self._board_to_graph(s)
-        print(f"After _board_to_graph - x shape: {x.shape}, edge_index shape: {edge_index.shape}")
         
         # GAT layers
         x = self.gat1(x, edge_index)
-        print(f"After gat1 - x shape: {x.shape}")
         x = F.elu(x)
         x = self.gat2(x, edge_index)
-        print(f"After gat2 - x shape: {x.shape}")
         x = F.elu(x)
         
         # Reshape x to (batch_size, nodes * features)
         batch_size = s.size(0)
         x = x.view(batch_size, -1)
-        print(f"After reshaping - x shape: {x.shape}")
         
         # FC layers
         x = F.relu(self.fc1(x))
-        print(f"After fc1 - x shape: {x.shape}")
         x = F.relu(self.fc2(x))
-        print(f"After fc2 - x shape: {x.shape}")
         
         pi = self.fc_policy(x)
         v = self.fc_value(x)
         
-        print(f"Output - pi shape: {pi.shape}, v shape: {v.shape}")
         
         return F.log_softmax(pi, dim=1), torch.tanh(v)
 
     def _board_to_graph(self, s):
-        print(f"_board_to_graph input shape: {s.shape}")
         # Ensure s is a 4D tensor (batch_size, 3, 3, 3)
         if s.dim() == 3:
             s = s.unsqueeze(0)
@@ -232,7 +221,6 @@ class NNetWrapper:
         self.criterion_v = nn.MSELoss()
 
     def train(self, examples):
-        print("Starting training...")
         train_examples, val_examples = train_test_split(examples, test_size=0.2)
 
         train_data = TensorDataset(
@@ -244,11 +232,9 @@ class NNetWrapper:
         train_loader = DataLoader(train_data, batch_size=self.args.batch_size, shuffle=True)
 
         for epoch in range(self.args.epochs):
-            print(f"Epoch {epoch+1}/{self.args.epochs}")
             self.nnet.train()
             total_loss = 0
             for batch_idx, (boards, target_pis, target_vs) in enumerate(train_loader):
-                print(f"Batch {batch_idx+1} - Input shape: {boards.shape}")
                 boards, target_pis, target_vs = boards.to(self.device), target_pis.to(self.device), target_vs.to(self.device)
                 
                 self.optimizer.zero_grad()
@@ -268,7 +254,6 @@ class NNetWrapper:
             val_loss = self.validate(val_examples)
             self.scheduler.step(val_loss)
 
-            print(f'Epoch {epoch+1}/{self.args.epochs}, Train Loss: {total_loss/len(train_loader):.3f}, Val Loss: {val_loss:.3f}')
 
     def validate(self, val_examples):
         self.nnet.eval()
@@ -287,18 +272,15 @@ class NNetWrapper:
         return val_loss / len(val_examples)
 
     def predict(self, board):
-        print(f"NNetWrapper predict - input board shape: {board.shape}")
         board = torch.FloatTensor(board.astype(np.float64))
         if board.dim() == 3:
             board = board.unsqueeze(0)
         board = board.to(self.device)
-        print(f"NNetWrapper predict - processed board shape: {board.shape}")
         
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
 
-        print(f"NNetWrapper predict - output pi shape: {pi.shape}, v shape: {v.shape}")
         return pi.exp().cpu().numpy()[0], v.cpu().numpy()[0].item() 
 
 
