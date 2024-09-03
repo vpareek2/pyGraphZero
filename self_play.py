@@ -1,5 +1,3 @@
-### REPLAY BUFFER USE IT
-
 import logging
 import os
 import sys
@@ -86,10 +84,7 @@ class Coach():
                     
                     if self.rank == 0:
                         iterationTrainExamples = deque(sum(all_examples, []), maxlen=self.args.maxlenOfQueue)
-                else:
-                    if self.rank == 0:
-                        iterationTrainExamples = deque(iterationTrainExamples, maxlen=self.args.maxlenOfQueue)
-
+                
                 if self.rank == 0:
                     self.trainExamplesHistory.append(iterationTrainExamples)
 
@@ -106,20 +101,35 @@ class Coach():
                     trainExamples.extend(e)
                 shuffle(trainExamples)
 
-                # training new network, keeping a copy of the old one
-                self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
-                self.pnet.load_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
-                pmcts = MCTS(self.game, self.pnet, self.args)
+            # Broadcast trainExamples to all processes
+            if self.args.distributed:
+                if self.rank == 0:
+                    examples_tensor = torch.tensor(trainExamples, dtype=torch.float32)
+                else:
+                    examples_tensor = torch.empty((0,), dtype=torch.float32)
+                
+                # Broadcast the size first
+                size_tensor = torch.tensor([examples_tensor.shape[0]], dtype=torch.long)
+                dist.broadcast(size_tensor, src=0)
+                
+                if self.rank != 0:
+                    examples_tensor = torch.empty(size_tensor[0].item(), dtype=torch.float32)
+                
+                # Then broadcast the data
+                dist.broadcast(examples_tensor, src=0)
+                
+                trainExamples = examples_tensor.tolist()
 
-            if self.args.distributed:
-                dist.barrier()
+            # training new network, keeping a copy of the old one
+            self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
+            self.pnet.load_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
+            pmcts = MCTS(self.game, self.pnet, self.args)
+
             self.nnet.train(trainExamples)
-            if self.args.distributed:
-                dist.barrier()
+
+            nmcts = MCTS(self.game, self.nnet, self.args)
 
             if self.rank == 0:
-                nmcts = MCTS(self.game, self.nnet, self.args)
-
                 log.info('PITTING AGAINST PREVIOUS VERSION')
                 arena = Arena(lambda x: np.argmax(pmcts.getActionProb(x, temp=0)),
                               lambda x: np.argmax(nmcts.getActionProb(x, temp=0)), self.game)

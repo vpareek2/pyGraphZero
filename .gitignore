@@ -2,3 +2,4 @@ __pycache__
 .DS_Store
 .vscode
 __init__.py
+self_play1.py
