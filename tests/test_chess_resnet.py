@@ -40,7 +40,7 @@ class TestChessResNet(unittest.TestCase):
         pi, v = self.nnet.predict(board)
         self.assertEqual(pi.shape, (self.game.get_action_size(),))
         self.assertIsInstance(v, float)
-        self.assertTrue(-1 <= v <= 1)  # Changed from 0 <= v <= 1
+        self.assertTrue(-1 <= v <= 1)
 
     def test_nnet_train(self):
         examples = [
