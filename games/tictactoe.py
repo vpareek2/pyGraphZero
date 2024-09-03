@@ -7,7 +7,7 @@ class TicTacToeGame:
 
     def get_init_board(self):
         b = Board(self.n)
-        return torch.tensor(b.pieces, dtype=torch.float32)
+        return torch.as_tensor(b.pieces, dtype=torch.float32)
 
     def get_board_size(self):
         return (self.n, self.n)

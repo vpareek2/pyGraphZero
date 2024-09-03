@@ -9,7 +9,7 @@ class MCTS:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Initialize tensors for parallel environments
-        self.num_envs = args.num_parallel_envs
+        self.num_envs = 1  # We'll always use a batch size of 1 for now
         self.action_size = game.get_action_size()
 
         # Tree structure
@@ -24,12 +24,16 @@ class MCTS:
 
         self.next_node = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
 
-    def get_action_prob(self, canonical_boards, temp=1):
+    def get_action_prob(self, canonical_board, temp=1):
+        # Ensure canonical_board is always a batch
+        if canonical_board.dim() == 2:
+            canonical_board = canonical_board.unsqueeze(0)
+        
         for _ in range(self.args.num_mcts_sims):
-            self.search(canonical_boards)
+            self.search(canonical_board)
 
-        s = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        counts = self.Nsa[torch.arange(self.num_envs), s]
+        s = torch.zeros(1, dtype=torch.long, device=self.device)
+        counts = self.Nsa[0, s]
 
         if temp == 0:
             best_actions = counts.argmax(dim=1)
@@ -46,9 +50,10 @@ class MCTS:
         probs = torch.clamp(probs, min=0)
         probs = probs / probs.sum(dim=1, keepdim=True)
 
-        return probs
+        return probs.squeeze(0)  # Remove batch dimension
 
     def search(self, canonical_boards):
+        # canonical_boards is already batched
         env_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         s = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         
@@ -94,6 +99,10 @@ class MCTS:
         pi, v = self.nnet.predict(canonical_boards)
         valids = self.game.get_valid_moves(canonical_boards, 1)
         
+        # Convert pi and valids to PyTorch tensors if they're not already
+        pi = torch.from_numpy(pi).float().to(self.device) if isinstance(pi, np.ndarray) else pi
+        valids = torch.from_numpy(valids).float().to(self.device) if isinstance(valids, np.ndarray) else valids
+        
         # Ensure pi and valids have the same shape as self.Ps
         pi = pi.view(len(s), -1)
         valids = valids.view(len(s), -1)
@@ -103,12 +112,13 @@ class MCTS:
             pi = torch.nn.functional.pad(pi, (0, self.action_size - pi.shape[1]))
             valids = torch.nn.functional.pad(valids, (0, self.action_size - valids.shape[1]))
         
-        self.Ps[torch.arange(len(s)), s] = pi.to(self.device)
-        self.Ps[torch.arange(len(s)), s] *= valids.to(self.device)
+        self.Ps[torch.arange(len(s)), s] = pi
+        self.Ps[torch.arange(len(s)), s] *= valids
         sum_Ps_s = self.Ps[torch.arange(len(s)), s].sum(dim=1, keepdim=True)
         self.Ps[torch.arange(len(s)), s] /= sum_Ps_s
-        self.Vs[torch.arange(len(s)), s] = valids.to(self.device).bool()  # Convert to boolean
+        self.Vs[torch.arange(len(s)), s] = valids.bool()  # Convert to boolean
         self.Es[torch.arange(len(s)), s] = self.game.get_game_ended(canonical_boards, 1)
+        v = torch.from_numpy(v).float().to(self.device) if isinstance(v, np.ndarray) else v
         v = v.squeeze(-1)
         return -v
 

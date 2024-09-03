@@ -172,7 +172,7 @@ class NNetWrapper:
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
-        return torch.exp(pi).data.cpu().numpy()[0], v.item()  # Convert v to a Python float
+        return pi, v  # Return PyTorch tensors directly
 
     def save_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
         if not self.is_main_process():
