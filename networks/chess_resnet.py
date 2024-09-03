@@ -136,7 +136,7 @@ class NNetWrapper:
             with autocast('cuda'):
                 out_pi, out_v = self.nnet(boards)
                 loss_pi = self.criterion_pi(out_pi, target_pis)
-                loss_v = self.criterion_v(out_v, target_vs)
+                loss_v = self.criterion_v(out_v, target_vs.float().unsqueeze(1))  # Unsqueeze target_vs
                 loss = loss_pi + loss_v
 
             self.scaler.scale(loss).backward()
@@ -157,7 +157,7 @@ class NNetWrapper:
                 boards, target_pis, target_vs = self.to_device(boards, target_pis, target_vs)
                 out_pi, out_v = self.nnet(boards)
                 loss_pi = self.criterion_pi(out_pi, target_pis)
-                loss_v = self.criterion_v(out_v, target_vs)
+                loss_v = self.criterion_v(out_v, target_vs.float().unsqueeze(1))  # Unsqueeze target_vs
                 val_loss += (loss_pi + loss_v).item()
 
         val_loss /= len(val_loader)
@@ -241,6 +241,9 @@ class NNetWrapper:
         
         if board.dim() == 3:
             board = board.unsqueeze(0)
+        
+        # Reshape the board to (N, 12, 8, 8)
+        board = board.permute(0, 3, 1, 2)
         
         return board
 

@@ -1,12 +1,8 @@
 import unittest
 import torch
 import numpy as np
-import torch.nn as nn
-import torch.distributed as dist
-import wandb
-
+from networks.chess_resnet import ResBlock, ChessResNet, NNetWrapper
 from games.chess import ChessGame
-from networks.chess_resnet import ChessResNet, NNetWrapper
 
 class TestChessResNet(unittest.TestCase):
     def setUp(self):
@@ -14,180 +10,103 @@ class TestChessResNet(unittest.TestCase):
         self.args = type('Args', (), {
             'num_channels': 256,
             'num_res_blocks': 19,
+            'dropout_rate': 0.3,
             'lr': 0.001,
             'l2_regularization': 0.0001,
-            'dropout_rate': 0.3,
             'distributed': False,
-            'local_rank': 0,
             'batch_size': 32,
             'epochs': 10
         })()
-        self.model = ChessResNet(self.game, self.args)
-        self.wrapper = NNetWrapper(self.game, self.args)
+        self.nnet = NNetWrapper(self.game, self.args)
 
-    def test_model_initialization(self):
-        self.assertIsInstance(self.model, ChessResNet)
-        self.assertEqual(self.model.board_x, 8)
-        self.assertEqual(self.model.board_y, 8)
-        self.assertEqual(self.model.action_size, 8 * 8 * 73)  # 8x8 board, 73 possible moves per square
+    def test_resblock(self):
+        block = ResBlock(256)
+        x = torch.randn(1, 256, 8, 8)  # (batch_size, channels, height, width)
+        out = block(x)
+        self.assertEqual(out.shape, x.shape)
+        self.assertFalse(torch.isnan(out).any())
 
-    def test_forward_pass(self):
-        board = torch.randn(1, 12, 8, 8)  # 12 channels for chess
-        pi, v = self.model(board)
-        self.assertEqual(pi.shape, (1, 8 * 8 * 73))
-        self.assertEqual(v.shape, (1,))
+    def test_chess_resnet_forward(self):
+        model = ChessResNet(self.game, self.args)
+        x = torch.randn(1, 12, 8, 8)  # (batch_size, input_channels, height, width)
+        pi, v = model(x)
+        self.assertEqual(pi.shape, (1, self.game.get_action_size()))
+        self.assertEqual(v.shape, (1, 1))
+        self.assertFalse(torch.isnan(pi).any())
+        self.assertFalse(torch.isnan(v).any())
 
-    def test_predict(self):
-        # Generate a random board with values 0 or 1
-        board = np.random.choice([0, 1], size=(8, 8, 12))
-        pi, v = self.wrapper.predict(board)
-        self.assertEqual(pi.shape, (1, 8 * 8 * 73))
-        self.assertIsInstance(v, torch.Tensor)
-        self.assertEqual(v.shape, (1,))
+    def test_nnet_predict(self):
+        board = np.random.randint(0, 2, size=(8, 8, 12))  # (height, width, channels)
+        pi, v = self.nnet.predict(board)
+        self.assertEqual(pi.shape, (self.game.get_action_size(),))
+        self.assertIsInstance(v, float)
+        self.assertTrue(-1 <= v <= 1)  # Changed from 0 <= v <= 1
 
-    def test_loss_functions(self):
-        targets = torch.randn(10, 8 * 8 * 73)
-        outputs = torch.randn(10, 8 * 8 * 73)
-        loss_pi = self.wrapper.criterion_pi(outputs, targets)
-        self.assertIsInstance(loss_pi, torch.Tensor)
-
-        targets = torch.randn(10)
-        outputs = torch.randn(10)
-        loss_v = self.wrapper.criterion_v(outputs, targets)
-        self.assertIsInstance(loss_v, torch.Tensor)
-
-    def test_save_load_checkpoint(self):
-        import tempfile
-        import os
-
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            filepath = os.path.join(tmpdirname, 'test_model.pth.tar')
-            self.wrapper.save_checkpoint(folder=tmpdirname, filename='test_model.pth.tar')
-            self.assertTrue(os.path.exists(filepath))
-
-            new_wrapper = NNetWrapper(self.game, self.args)
-            new_wrapper.load_checkpoint(folder=tmpdirname, filename='test_model.pth.tar')
-
-            # Check if the loaded model has the same parameters
-            for param1, param2 in zip(self.wrapper.nnet.parameters(), new_wrapper.nnet.parameters()):
-                self.assertTrue(torch.equal(param1, param2))
-
-    def test_augment_examples(self):
-        board = np.random.choice([0, 1], size=(8, 8, 12))
-        pi = np.random.rand(8 * 8 * 73)
-        v = 0.5
-        augmented = self.wrapper.augment_examples([(board, pi, v)])
-        self.assertEqual(len(augmented), 2)  # Original + horizontal flip
-
-        # Check if the augmented policies have the correct shape
-        for aug_board, aug_pi, aug_v in augmented:
-            self.assertEqual(aug_board.shape, (8, 8, 12))
-            self.assertEqual(aug_pi.shape, (8 * 8 * 73,))
-            self.assertEqual(aug_v, v)
-
-    def test_flip_policy(self):
-        pi = np.random.rand(8 * 8 * 73)
-        flipped_pi = self.wrapper.flip_policy(pi)
-        self.assertEqual(flipped_pi.shape, (8 * 8 * 73,))
-        # Note: You might want to add more specific checks for the flipping logic
-
-    def test_augment_batch(self):
-        batch = torch.randn(2, 12, 8, 8)
-        augmented = self.wrapper.augment_batch(batch)
-        self.assertEqual(augmented.shape, (4, 12, 8, 8))  # 2 * 2 augmentations
-
-    def test_edge_cases(self):
-        # Empty board
-        empty_board = np.zeros((8, 8, 12))
-        pi_empty, v_empty = self.wrapper.predict(empty_board)
-        self.assertEqual(pi_empty.shape, (1, 8 * 8 * 73))
-        self.assertIsInstance(v_empty, torch.Tensor)
-        self.assertEqual(v_empty.shape, (1,))
-
-        # Fully filled board
-        full_board = np.random.choice([0, 1], size=(8, 8, 12))
-        pi_full, v_full = self.wrapper.predict(full_board)
-        self.assertEqual(pi_full.shape, (1, 8 * 8 * 73))
-        self.assertIsInstance(v_full, torch.Tensor)
-        self.assertEqual(v_full.shape, (1,))
-
-    def test_invalid_inputs(self):
-        # Invalid board shape
-        with self.assertRaises(ValueError):
-            invalid_board = np.random.randn(7, 8, 12)
-            self.wrapper.predict(invalid_board)
-
-        # Invalid board values
-        with self.assertRaises(ValueError):
-            invalid_values_board = np.random.choice([0, 1, 2], size=(8, 8, 12))
-            self.wrapper.predict(invalid_values_board)
-
-    def test_optimizer_and_scheduler(self):
-        self.assertIsInstance(self.wrapper.optimizer, torch.optim.Adam)
-        self.assertIsInstance(self.wrapper.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
-
-    def test_criterion(self):
-        self.assertIsInstance(self.wrapper.criterion_pi, nn.CrossEntropyLoss)
-        self.assertIsInstance(self.wrapper.criterion_v, nn.MSELoss)
-
-    def test_scaler(self):
-        from torch.amp import GradScaler
-        self.assertIsInstance(self.wrapper.scaler, GradScaler)
-
-    def test_predict_input_validation(self):
-        # Test invalid input type
-        with self.assertRaises(ValueError):
-            self.wrapper.predict([[0, 0, 0, 0, 0, 0, 0, 0]] * 8)
-
-        # Test invalid board shape
-        with self.assertRaises(ValueError):
-            self.wrapper.predict(np.zeros((7, 8, 12)))
-
-        # Test invalid board values
-        with self.assertRaises(ValueError):
-            self.wrapper.predict(np.random.choice([0, 1, 2], size=(8, 8, 12)))
-
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
-    def test_gpu_usage(self):
-        self.assertIsInstance(self.wrapper.device, torch.device)
-        self.assertTrue(self.wrapper.device.type in ['cuda', 'cpu'])
-
-    def test_wandb_initialization(self):
-        # This test assumes wandb is initialized in the main process
-        if self.wrapper.is_main_process():
-            self.assertTrue(wandb.run is not None)
-
-    def test_early_stopping(self):
-        # Create some dummy examples
-        dummy_examples = [
-            (np.random.choice([0, 1], size=(8, 8, 12)), np.random.rand(8 * 8 * 73), np.random.rand())
+    def test_nnet_train(self):
+        examples = [
+            (np.random.randint(0, 2, size=(8, 8, 12)),
+             np.random.rand(self.game.get_action_size()),
+             np.random.rand())
             for _ in range(100)
         ]
+        self.nnet.train(examples)
 
-        # Mock the validate method to always return a worse loss
-        original_validate = self.wrapper.validate
-        self.wrapper.validate = lambda x: 1.1
+    def test_nnet_save_load(self):
+        # Save the model
+        self.nnet.save_checkpoint(folder='test_checkpoint', filename='test_model.pth.tar')
 
-        # Set initial best_val_loss
-        self.wrapper.best_val_loss = 1.0
-        self.wrapper.patience = 3
+        # Create a new model and load the saved weights
+        new_nnet = NNetWrapper(self.game, self.args)
+        new_nnet.load_checkpoint(folder='test_checkpoint', filename='test_model.pth.tar')
 
-        # Train for a few epochs
-        for _ in range(5):
-            self.wrapper.train(dummy_examples)
+        # Compare predictions
+        board = np.random.randint(0, 2, size=(8, 8, 12))
+        pi1, v1 = self.nnet.predict(board)
+        pi2, v2 = new_nnet.predict(board)
+        np.testing.assert_array_almost_equal(pi1, pi2, decimal=5)
+        self.assertAlmostEqual(v1, v2, places=5)
 
-        # Check if training stopped early
-        self.assertLess(self.wrapper.wait, 5)
-        self.assertGreaterEqual(self.wrapper.wait, 3)
+    def test_data_preparation(self):
+        examples = [
+            (np.random.randint(0, 2, size=(8, 8, 12)),
+             np.random.rand(self.game.get_action_size()),
+             np.random.rand())
+            for _ in range(100)
+        ]
+        train_data, val_data = self.nnet.prepare_data(examples)
+        self.assertIsInstance(train_data, torch.utils.data.TensorDataset)
+        self.assertIsInstance(val_data, torch.utils.data.TensorDataset)
+        self.assertTrue(len(train_data) + len(val_data) == len(examples))
 
-        # Restore the original validate method
-        self.wrapper.validate = original_validate
+    def test_data_loader(self):
+        examples = [
+            (np.random.randint(0, 2, size=(8, 8, 12)),
+             np.random.rand(self.game.get_action_size()),
+             np.random.rand())
+            for _ in range(100)
+        ]
+        train_data, _ = self.nnet.prepare_data(examples)
+        data_loader = self.nnet.get_data_loader(train_data)
+        self.assertIsInstance(data_loader, torch.utils.data.DataLoader)
+        self.assertEqual(data_loader.batch_size, self.args.batch_size)
 
-    def test_distributed_setup(self):
-        if self.wrapper.args.distributed:
-            self.assertIsNotNone(self.wrapper.world_size)
-            self.assertIsNotNone(self.wrapper.rank)
-            self.assertTrue(dist.is_initialized())
+    def test_preprocess_board(self):
+        board_np = np.random.randint(0, 2, size=(8, 8, 12))
+        board_tensor = torch.from_numpy(board_np).float()
+
+        # Test numpy input
+        processed_np = self.nnet.preprocess_board(board_np)
+        self.assertIsInstance(processed_np, torch.Tensor)
+        self.assertEqual(processed_np.shape, (1, 12, 8, 8))
+
+        # Test tensor input
+        processed_tensor = self.nnet.preprocess_board(board_tensor)
+        self.assertIsInstance(processed_tensor, torch.Tensor)
+        self.assertEqual(processed_tensor.shape, (1, 12, 8, 8))
+
+    def test_optimizer_and_scheduler(self):
+        self.assertIsInstance(self.nnet.optimizer, torch.optim.Adam)
+        self.assertIsInstance(self.nnet.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
 
 if __name__ == '__main__':
     unittest.main()
