@@ -49,7 +49,9 @@ class TicTacToeResNet(nn.Module):
         self.dropout = nn.Dropout(p=args.dropout_rate)
 
     def forward(self, s):
+        print(f"Input shape: {s.shape}")
         s = s.view(-1, 1, self.board_x, self.board_y)
+        print(f"Reshaped input: {s.shape}")
         s = F.relu(self.bn(self.conv(s)))
 
         for res_block in self.res_blocks:
@@ -71,22 +73,22 @@ class TicTacToeResNet(nn.Module):
 
 class NNetWrapper:
     def __init__(self, game, args):
-        self.game = game
         self.args = args
-        self.device = self.setup_device()
-
-        self.nnet = TicTacToeResNet(game, args).to(self.device)
-        if args.distributed:
-            self.nnet = DDP(self.nnet, device_ids=[args.local_rank], output_device=args.local_rank)
-        elif torch.cuda.device_count() > 1:
-            self.nnet = nn.DataParallel(self.nnet)
-
-        self.optimizer = optim.Adam(self.nnet.parameters(), lr=args.lr, weight_decay=args.l2_regularization)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5)
-        self.scaler = GradScaler('cuda')
-
-        self.criterion_pi = nn.CrossEntropyLoss()
-        self.criterion_v = nn.MSELoss()
+        self.game = game
+        self.device = torch.device(args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu'))
+        
+        print(f"Initializing network on device: {self.device}")
+        
+        try:
+            # Initialize the network
+            self.nnet = TicTacToeResNet(game, args)
+            
+            # Move the network to the specified device
+            self.nnet = self.nnet.to(self.device)
+            print("Network successfully moved to device")
+        except Exception as e:
+            print(f"Error initializing network: {str(e)}")
+            raise
 
     def setup_device(self):
         if self.args.distributed:
@@ -169,6 +171,8 @@ class NNetWrapper:
 
     def predict(self, board):
         board = self.preprocess_board(board)
+        print(f"Board device: {board.device}")
+        print(f"Network device: {next(self.nnet.parameters()).device}")
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
