@@ -20,27 +20,27 @@ class GATLayer(nn.Module):
         self.concat = concat
         self.activation = activation
         self.add_skip_connection = add_skip_connection
-        
+
         self.linear_proj = nn.Linear(in_features, num_heads * out_features, bias=False)
         self.scoring_fn_target = nn.Parameter(torch.Tensor(1, num_heads, out_features))
         self.scoring_fn_source = nn.Parameter(torch.Tensor(1, num_heads, out_features))
-        
+
         if bias and concat:
             self.bias = nn.Parameter(torch.Tensor(num_heads * out_features))
         elif bias and not concat:
             self.bias = nn.Parameter(torch.Tensor(out_features))
         else:
             self.register_parameter('bias', None)
-        
+
         if add_skip_connection:
             self.skip_proj = nn.Linear(in_features, num_heads * out_features, bias=False)
         else:
             self.register_parameter('skip_proj', None)
-        
+
         self.leakyReLU = nn.LeakyReLU(0.2)
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout_prob)
-        
+
         self.init_params()
 
     def init_params(self):
@@ -63,7 +63,7 @@ class GATLayer(nn.Module):
         scores_target = (x * self.scoring_fn_target).sum(dim=-1)
         scores_source_lifted, scores_target_lifted, x_lifted = self.lift(scores_source, scores_target, x, edge_index)
         scores_per_edge = self.leakyReLU(scores_source_lifted + scores_target_lifted)
-        
+
         attentions_per_edge = self.neighborhood_aware_softmax(scores_per_edge, edge_index[1], num_nodes)
         attentions_per_edge = self.dropout(attentions_per_edge)
 
@@ -131,56 +131,84 @@ class GATLayer(nn.Module):
 
 class ChessGAT(nn.Module):
     def __init__(self, game, args):
-        super(ChessGAT, self).__init__()
-        self.board_x, self.board_y = game.get_board_size()
-        self.action_size = game.get_action_size()
-        self.args = args
+        super().__init__()
+        self.num_gat_layers = 4  # Deeper network
 
-        self.num_nodes = self.board_x * self.board_y
-        self.num_features = 12  # 6 piece types for each player
+        # Initial embedding
+        self.piece_embedding = nn.Linear(12, args.num_channels)
 
-        self.gat1 = GATLayer(self.num_features, args.num_channels, num_heads=args.num_heads, dropout_prob=args.dropout_rate)
-        self.gat2 = GATLayer(args.num_channels * args.num_heads, args.num_channels, num_heads=args.num_heads, dropout_prob=args.dropout_rate)
-        
-        self.fc1 = nn.Linear(args.num_channels * args.num_heads * self.num_nodes, 1024)
-        self.fc2 = nn.Linear(1024, 512)
-        
-        self.fc_policy = nn.Linear(512, self.action_size)
-        self.fc_value = nn.Linear(512, 1)
+        # Multiple GAT layers
+        self.gat_layers = nn.ModuleList([
+            GATLayer(
+                args.num_channels if i == 0 else args.num_channels * args.num_heads,
+                args.num_channels,
+                args.num_heads
+            ) for i in range(self.num_gat_layers)
+        ])
+
+        # Layer norms after each GAT
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(args.num_channels * args.num_heads)
+            for _ in range(self.num_gat_layers)
+        ])
+
+        # Policy head
+        self.policy_head = nn.Sequential(
+            nn.Linear(args.num_channels * args.num_heads * self.num_nodes, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Dropout(args.dropout_rate),
+            nn.Linear(1024, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(args.dropout_rate),
+            nn.Linear(512, self.action_size)
+        )
+
+        # Value head
+        self.value_head = nn.Sequential(
+            nn.Linear(args.num_channels * args.num_heads * self.num_nodes, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(args.dropout_rate),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(args.dropout_rate),
+            nn.Linear(256, 1)
+        )
 
     def forward(self, s):
-        x, edge_index = self._board_to_graph(s)
-        
-        # GAT layers
-        x = self.gat1(x, edge_index)
-        x = F.elu(x)
-        x = self.gat2(x, edge_index)
-        x = F.elu(x)
-        
-        # Reshape x to (batch_size, nodes * features)
-        batch_size = s.size(0)
-        x = x.view(batch_size, -1)
-        
-        # FC layers
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        
-        pi = self.fc_policy(x)
-        v = self.fc_value(x)
-        
+        x, edge_index, edge_attr = self._board_to_graph(s)
+        x = self.piece_embedding(x)
+
+        # GAT layers with residual connections
+        for gat, norm in zip(self.gat_layers, self.layer_norms):
+            residual = x
+            x = gat(x, edge_index, edge_attr)
+            x = norm(x)
+            if x.shape == residual.shape:  # Add residual if shapes match
+                x = x + residual
+
+        x = x.view(s.size(0), -1)
+
+        # Policy and value heads
+        pi = self.policy_head(x)
+        v = self.value_head(x)
+
         return F.log_softmax(pi, dim=1), torch.tanh(v)
 
     def _board_to_graph(self, s):
         # Ensure s is a 4D tensor (batch_size, 12, 8, 8)
         if s.dim() == 3:
             s = s.unsqueeze(0)
-        
+
         batch_size, channels, height, width = s.shape
         assert channels == 12 and height == 8 and width == 8, "Input should be (batch_size, 12, 8, 8)"
-        
+
         # Reshape s to (batch_size * num_nodes, 12)
         x = s.view(batch_size * self.num_nodes, 12)
-        
+
         # Create edge index for Chess graph structure
         edge_index_single = []
         for i in range(self.board_x):
@@ -198,14 +226,14 @@ class ChessGAT(nn.Module):
                     if 0 <= ni < self.board_x and 0 <= nj < self.board_y:
                         neighbor = ni * self.board_y + nj
                         edge_index_single.extend([[node, neighbor], [neighbor, node]])
-        
+
         edge_index_single = torch.tensor(edge_index_single, device=s.device).t()
-        
+
         # Repeat the edge index for each graph in the batch
         edge_index = edge_index_single.repeat(1, batch_size)
         batch_offset = torch.arange(batch_size, device=s.device).repeat_interleave(edge_index_single.size(1)) * self.num_nodes
         edge_index = edge_index + batch_offset
-        
+
         return x, edge_index
 
 class NNetWrapper:
@@ -238,7 +266,7 @@ class NNetWrapper:
             torch.FloatTensor([ex[1] for ex in train_examples]),
             torch.FloatTensor([ex[2] for ex in train_examples])
         )
-        
+
         train_loader = DataLoader(train_data, batch_size=self.args.batch_size, shuffle=True)
 
         for epoch in range(self.args.epochs):
@@ -246,9 +274,9 @@ class NNetWrapper:
             total_loss = 0
             for batch_idx, (boards, target_pis, target_vs) in enumerate(train_loader):
                 boards, target_pis, target_vs = boards.to(self.device), target_pis.to(self.device), target_vs.to(self.device)
-                
+
                 self.optimizer.zero_grad()
-                
+
                 with autocast(device_type=self.device.type):
                     out_pi, out_v = self.nnet(boards)
                     l_pi = self.criterion_pi(out_pi, target_pis)
@@ -272,7 +300,7 @@ class NNetWrapper:
                 board = torch.FloatTensor(board.astype(np.float64)).unsqueeze(0).to(self.device)
                 target_pi = torch.FloatTensor(target_pi).unsqueeze(0).to(self.device)
                 target_v = torch.FloatTensor([target_v]).to(self.device)
-                
+
                 out_pi, out_v = self.nnet(board)
                 l_pi = self.criterion_pi(out_pi, target_pi)
                 l_v = self.criterion_v(out_v.squeeze(-1), target_v)
@@ -285,12 +313,12 @@ class NNetWrapper:
         if board.dim() == 3:
             board = board.unsqueeze(0)
         board = board.to(self.device)
-        
+
         self.nnet.eval()
         with torch.no_grad():
             pi, v = self.nnet(board)
 
-        return pi.exp().cpu().numpy()[0], v.cpu().numpy()[0].item() 
+        return pi.exp().cpu().numpy()[0], v.cpu().numpy()[0].item()
 
 
     def save_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
@@ -323,10 +351,10 @@ class NNetWrapper:
         for board, pi, v in examples:
             # Original example
             augmented.append((board, pi, v))
-            
+
             # Horizontal flip
             flipped_board = np.fliplr(board)
             flipped_pi = np.flip(pi)
             augmented.append((flipped_board, flipped_pi, v))
-        
+
         return augmented
