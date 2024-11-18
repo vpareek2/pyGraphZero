@@ -19,9 +19,5 @@ The project provides two implementations:
 - Baseline AlphaZero CNN: 19 residual blocks, 256 channels
 More information in Paper.
 
+<iframe src="graphzero.pdf" width="100%" height="600px"></iframe>
 
-
-
-## Contact
-Veer Pareek
-veerpareek12@gmail.com
